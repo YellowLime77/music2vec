@@ -1,0 +1,23 @@
+[app]
+
+title = Music2Vec Android
+package.name = music2vecandroid
+package.domain = org.example
+source.dir = .
+source.include_exts = py,png,jpg,kv,atlas,json,txt
+version = 0.1.0
+
+# Torch/MuQ on Android may require custom wheels or a tailored Python-for-Android recipe.
+# Keep this as a starting point and adjust for your target device/ABI.
+requirements = python3,kivy,numpy,librosa,soundfile,torch,muq
+
+orientation = portrait
+fullscreen = 0
+
+android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+android.api = 33
+android.minapi = 24
+
+[buildozer]
+log_level = 2
+warn_on_root = 1
