@@ -35,9 +35,36 @@ class DataLoaderThread(QThread):
         mulan = mulan.to(device).eval()
         model_lock = threading.Lock()
 
-        self.progress.emit("Loading audio files...")
-        directory = 'songs'
+        self.progress.emit("Normalizing audio files (24kHz, 128kbps)...")
+        input_directory = 'songs'
+        directory = 'songs_normalized'
+        os.makedirs(directory, exist_ok=True)
         os.makedirs(CACHE_DIR, exist_ok=True)
+
+        if os.path.exists(input_directory):
+            import subprocess
+            raw_files = [f for f in os.listdir(input_directory) if os.path.isfile(os.path.join(input_directory, f)) and f.endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a'))]
+            
+            def normalize_file(filename):
+                in_path = os.path.join(input_directory, filename)
+                out_path = os.path.join(directory, f"{os.path.splitext(filename)[0]}.mp3")
+                if not os.path.exists(out_path):
+                    cmd = ['ffmpeg', '-y', '-i', in_path, '-ar', '24000', '-b:a', '128k', out_path]
+                    try:
+                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except FileNotFoundError:
+                        pass # ffmpeg not installed
+
+            if raw_files:
+                max_workers = max(1, min(8, (os.cpu_count() or 4)))
+                completed = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(normalize_file, f) for f in raw_files]
+                    for future in as_completed(futures):
+                        completed += 1
+                        self.progress_percent.emit(int(completed / len(raw_files) * 30))
+
+        self.progress.emit("Loading audio files...")
         
         audio_files = []
         if os.path.exists(directory):
@@ -59,6 +86,7 @@ class DataLoaderThread(QThread):
                 return file_entry.name, embeds, "cached"
 
             wav, _ = librosa.load(audio_file, sr=24000)
+            wav = librosa.util.normalize(wav)
             wavs = torch.tensor(wav).unsqueeze(0).to(device)
 
             with model_lock:
@@ -80,7 +108,7 @@ class DataLoaderThread(QThread):
                     audio_embeddings[song_name] = embeds
                     action = "Loading cached" if source == "cached" else "Extracting"
                     self.progress.emit(f"{action}: {song_name}")
-                    self.progress_percent.emit(int(completed / total_files * 100))
+                    self.progress_percent.emit(int(30 + (completed / total_files * 70)))
 
         self.progress.emit("Ready!")
         self.progress_percent.emit(100)
@@ -217,8 +245,36 @@ class MusicApp(QMainWindow):
         text_layout.addWidget(self.text_input)
         text_layout.addWidget(self.find_text_btn)
 
+        # Describe Song Tab
+        describe_tab = QWidget()
+        describe_layout = QVBoxLayout(describe_tab)
+        
+        describe_search_layout = QHBoxLayout()
+        self.describe_search_input = QLineEdit()
+        self.describe_search_input.setPlaceholderText("Search library...")
+        self.describe_search_input.textChanged.connect(self.filter_describe_library)
+        
+        self.describe_song_btn = QPushButton("Describe Selected Song")
+        self.describe_song_btn.clicked.connect(self.describe_selected_song)
+        self.describe_song_btn.setEnabled(False)
+        
+        describe_search_layout.addWidget(QLabel("Library:"))
+        describe_search_layout.addWidget(self.describe_search_input)
+        describe_search_layout.addWidget(self.describe_song_btn)
+        describe_layout.addLayout(describe_search_layout)
+
+        self.describe_library_list = QListWidget()
+        self.describe_library_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.describe_library_list.setMaximumHeight(150)
+        describe_layout.addWidget(self.describe_library_list)
+        
+        describe_layout.addWidget(QLabel("Description Results:"))
+        self.describe_results_list = QListWidget()
+        describe_layout.addWidget(self.describe_results_list)
+
         self.search_tabs.addTab(song_tab, "Search by Song")
         self.search_tabs.addTab(text_tab, "Search by Text")
+        self.search_tabs.addTab(describe_tab, "Describe Song")
         layout.addWidget(self.search_tabs)
 
         # Results
@@ -240,6 +296,12 @@ class MusicApp(QMainWindow):
             item = self.song_library_list.item(i)
             item.setHidden(search_term not in item.text().lower())
 
+    def filter_describe_library(self, text):
+        search_term = text.lower()
+        for i in range(self.describe_library_list.count()):
+            item = self.describe_library_list.item(i)
+            item.setHidden(search_term not in item.text().lower())
+
     def loadData(self):
         self.loader = DataLoaderThread()
         self.loader.progress.connect(self.status_label.setText)
@@ -254,12 +316,14 @@ class MusicApp(QMainWindow):
         self.progress_bar.setValue(100)
         
         self.song_library_list.addItems(song_names)
+        self.describe_library_list.addItems(song_names)
         has_songs = len(song_names) > 0
         self.find_song_btn.setEnabled(has_songs)
         self.find_text_btn.setEnabled(has_songs)
         self.play_selected_btn.setEnabled(has_songs)
         self.add_to_group_1_btn.setEnabled(has_songs)
         self.add_to_group_2_btn.setEnabled(has_songs)
+        self.describe_song_btn.setEnabled(has_songs)
 
     def get_group_song_names(self, group_index):
         list_widget = self.song_group_list_1 if group_index == 1 else self.song_group_list_2
@@ -385,6 +449,94 @@ class MusicApp(QMainWindow):
         self.status_label.setText("Ready!")
         self.rank_and_display(text_embed, None)
 
+    def describe_selected_song(self):
+        selected_items = self.describe_library_list.selectedItems()
+        if not selected_items:
+            self.status_label.setText("Please select a song from the list first.")
+            return
+
+        song_name = selected_items[0].text().strip()
+        if not song_name or song_name not in self.audio_embeddings:
+            self.status_label.setText("Please select a valid song first.")
+            return
+
+        audio_embed = self.audio_embeddings[song_name]
+
+        # Use an expanded list of predefined tags
+        tags = [
+            # Genres & Subgenres
+            "pop", "rock", "hip hop", "rap", "jazz", "classical", "electronic", "edm", "country", "r&b", 
+            "folk", "indie", "alternative", "soul", "blues", "metal", "death metal", "black metal", "reggae", 
+            "punk", "pop punk", "disco", "house", "deep house", "techno", "trance", "dubstep", "ambient", 
+            "lo-fi", "synthwave", "vaporwave", "grunge", "emo", "ska", "k-pop", "j-pop", "latin", "reggaeton", 
+            "salsa", "bossa nova", "afrobeats", "gospel", "funk", "bluegrass", "country rock", "math rock", 
+            "progressive rock", "post-rock", "shoegaze", "hyperpop", "chiptune", "classical crossover", 
+            "operatic", "orchestral", "trap", "drill", "drum and bass", "garage", "grime", "psytrance", 
+            "hardstyle", "industrial", "synthpop", "new wave", "goth", "americana", "zydeco", "mariachi",
+
+            # Instruments
+            "acoustic guitar", "electric guitar", "bass guitar", "slap bass", "piano", "grand piano", "electric piano", 
+            "synthesizer", "keyboard", "drums", "drum machine", "percussion", "cymbals", "hi-hat", "snare", 
+            "kick drum", "strings", "violin", "cello", "viola", "double bass", "brass", "trumpet", "saxophone", 
+            "trombone", "french horn", "woodwinds", "flute", "clarinet", "oboe", "bassoon", "vocals", "male vocals", 
+            "female vocals", "choir", "a cappella", "rapping", "screaming", "growling", "falsetto", "harmonies", 
+            "backing vocals", "beatboxing", "turntables", "sampler", "808", "banjo", "mandolin", "ukulele", 
+            "harp", "sitar", "accordion", "harmonica", "kazoo", "xylophone", "glockenspiel", "marimba", "vibraphone", 
+            "timpani", "bongos", "congas", "djembe", "tambourine", "cowbell", "triangle", "shaker", "castanets", 
+            "gong", "chimes", "bells", "organ", "pipe organ", "mellotron", "theremin", "vocoder", "talkbox",
+
+            # Moods,  Feels & Emotions
+            "happy", "sad", "angry", "calm", "energetic", "relaxing", "upbeat", "melancholy", "romantic", "dark", 
+            "eerie", "spooky", "tense", "anxious", "uplifting", "joyful", "triumphant", "euphoric", "depressing", 
+            "gloomy", "nostalgic", "sentimental", "dreamy", "hypnotic", "trippy", "psychedelic", "aggressive", 
+            "fierce", "intense", "peaceful", "serene", "soothing", "chill", "groovy", "funky", "soulful", 
+            "sensual", "sexy", "passionate", "epic", "cinematic", "dramatic", "suspenseful", "quirky", "playful", 
+            "silly", "humorous", "mysterious", "mystical", "ethereal", "majestic", "grand", "heroic", "noble", 
+            "tragic", "sorrowful", "mournful", "heartbreaking", "bittersweet", "wistful", "reflective", "pensive", 
+            "introspective", "contemplative", "meditative", "zen", "spiritual", "transcendent", "otherworldly",
+
+            # Tempo, Dynamics & Structure
+            "fast tempo", "slow tempo", "medium tempo", "mid-tempo", "up-tempo", "down-tempo", "heavy", "light", 
+            "loud", "quiet", "dynamic", "static", "crescendo", "build-up", "drops", "beat drop", "fade out", 
+            "staccato", "legato", "groove", "syncopation", "polyrhythm", "odd time signature", "4/4 time", 
+            "acoustic", "electric", "unplugged", "live recording", "studio recording", "raw", "polished", 
+            "overproduced", "high fidelity", "compressed", "distorted", "clean", "reverb-heavy", "echoey", 
+            "atmospheric", "spatial", "wall of sound", "minimalist", "maximalist", "sparse", "dense", "monotonous", 
+            "repetitive", "catchy hook", "melodic", "dissonant", "harmonic", "atonal", "rhythmic", "vocal-driven", 
+            "instrumental", "bassy", "treble-heavy", "muffled", "muffled kicks", "crisp", "punchy", "smooth", 
+            "harsh", "abrasive", "gritty", "fuzzy", "fuzzy guitar", "warm", "cold", "metallic", "wooden", "organic", 
+            "synthetic", "robotic", "robotic vocals", "autotune"
+        ]
+
+        self.status_label.setText(f"Describing {song_name}...")
+        QApplication.processEvents()
+
+        try:
+            with torch.no_grad():
+                text_embeds = self.mulan(texts=tags)
+            
+            # Compute similarity
+            similarities = []
+            for i, tag in enumerate(tags):
+                tag_embed = text_embeds[i].unsqueeze(0)
+                sim = torch.nn.functional.cosine_similarity(audio_embed, tag_embed, dim=-1).item()
+                similarities.append((sim, tag))
+                
+            similarities.sort(key=lambda x: x[0], reverse=True)
+            
+            self.describe_results_list.clear()
+            self.describe_results_list.addItem(f"Top tags for '{song_name}':\n")
+            for sim, tag in similarities[:15]:
+                self.describe_results_list.addItem(f"{tag} (Similarity: {sim:.4f})")
+                
+            self.status_label.setText("Ready!")
+            
+        except Exception as e:
+            import traceback
+            with open("ui_error.log", "w") as f:
+                traceback.print_exc(file=f)
+            self.status_label.setText("Error occurred, check ui_error.log")
+
     def rank_and_display(self, target_embed_1, target_embed_2, exclude_songs=None):
         try:
             excluded = set(exclude_songs or [])
@@ -449,7 +601,7 @@ class MusicApp(QMainWindow):
         self.set_play_icon(self.play_result_btn)
 
     def get_song_path(self, song_name):
-        return os.path.join('songs', song_name)
+        return os.path.join('songs_normalized', song_name)
 
     def play_song_sample(self, song_name, source_button):
         if not song_name:
