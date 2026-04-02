@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "c:\Users\matth\Desktop\Random Projects\music2vec\old_app.py", line 678, in rank_and_display
-    sim1 = calc_sim(target_embed_1, embed) if target_embed_1 is not None else 0
-  File "c:\Users\matth\Desktop\Random Projects\music2vec\old_app.py", line 676, in calc_sim
-    return torch.nn.functional.cosine_similarity(target_embed, e, dim=-1).item()
-RuntimeError: Expected all tensors to be on the same device, but got min is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA_clamp_min__Tensor)
