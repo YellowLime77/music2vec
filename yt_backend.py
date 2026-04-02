@@ -7,6 +7,8 @@ import torchaudio
 import yt_dlp
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from spotdl import Spotdl
 from muq import MuQMuLan
 from typing import List, Dict, Optional, Any
 from fastapi.middleware.cors import CORSMiddleware
@@ -245,6 +247,81 @@ def extract_embedding(req: UploadReq):
     if not input_text:
         raise HTTPException(status_code=400, detail="Empty query")
         
+    extracted_songs = []
+    processed_count = 0
+    
+    # Check if Spotify URL
+    if "open.spotify.com" in input_text:
+        try:
+            spotdl = Spotdl(client_id="ae09839d37b945c2befde3297bee7dde", client_secret="5b6d92a5da9041d89cf3ac2fe188edc9")
+            songs = spotdl.search([input_text])
+            
+            temp_dir = tempfile.mkdtemp()
+            # Change directory temporarily so SpotDL downloads into the temp dir
+            original_dir = os.getcwd()
+            os.chdir(temp_dir)
+            
+            try:
+                results = spotdl.download_songs(songs)
+            finally:
+                os.chdir(original_dir)
+            
+            for result, _ in results:
+                if not result:
+                    continue
+                # spot_dl leaves the downloaded file in the temp dir
+                pt_file = [f for f in os.listdir(temp_dir) if f.endswith('.mp3')]
+                for file_name in pt_file:
+                    audio_path = os.path.join(temp_dir, file_name)
+                    # Use SpotDL's song object to get a suitable ID and meta
+                    yt_id = "spot_" + sum([ord(c) for c in file_name]) # simple hash
+                    yt_id = file_name.replace(".mp3", "").replace(" ", "_") # Better simple ID
+                    
+                    display_name = file_name.replace(".mp3", "")
+                    
+                    if yt_id in audio_embeddings or yt_id in temp_embeddings:
+                        if os.path.exists(audio_path):
+                            os.remove(audio_path)
+                        continue
+                        
+                    wav_tensor, sr = torchaudio.load(audio_path)
+                    if wav_tensor.shape[0] > 1:
+                        wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
+                        
+                    max_val = torch.max(torch.abs(wav_tensor))
+                    if max_val > 0:
+                        wav_tensor = wav_tensor / max_val
+                        
+                    wav_tensor = wav_tensor.to(device)
+                    
+                    with torch.no_grad():
+                        with model_lock:
+                            embed = mulan(wavs=wav_tensor)
+                        
+                    embed = embed[0].unsqueeze(0).cpu()
+                    
+                    temp_embeddings[yt_id] = embed
+                    temp_song_names[yt_id] = display_name
+                    extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
+                    
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+                        
+                    processed_count += 1
+            
+            try:
+                for f in os.listdir(temp_dir):
+                    os.remove(os.path.join(temp_dir, f))
+                os.rmdir(temp_dir)
+            except:
+                pass
+                
+            return {"processed": processed_count, "extracted": extracted_songs}
+                
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # --- YouTube Logic ---
     search_url = input_text
     if 'list=' in input_text:
         pass
@@ -257,10 +334,31 @@ def extract_embedding(req: UploadReq):
     else:
         search_url = f'https://www.youtube.com/watch?v={input_text}'
 
-    temp_dir = tempfile.mkdtemp()
-    extracted_songs = []
-    
+    yt_ids = []
+    ydl_opts_extract = {
+        'extract_flat': True, 
+        'quiet': True,
+        'ignoreerrors': True,
+        'sleep_interval': 10,
+        'max_sleep_interval': 30,
+        'sleep_requests': 1
+    }
     try:
+        with yt_dlp.YoutubeDL(ydl_opts_extract) as ydl:
+            info = ydl.extract_info(search_url, download=False)
+            if info and 'entries' in info:
+                yt_ids = [entry['id'] for entry in info['entries'] if entry]
+            elif info:
+                yt_ids = [info['id']]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract IDs: {str(e)}")
+
+    def process_yt_id(yt_id):
+        if yt_id in audio_embeddings or yt_id in temp_embeddings:
+            return None
+            
+        temp_dir = tempfile.mkdtemp()
+        audio_path = os.path.join(temp_dir, f"{yt_id}.mp3")
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -271,44 +369,35 @@ def extract_embedding(req: UploadReq):
             'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
-            'postprocessor_args': ['-ar', '24000', '-ac', '1'],
-            'extract_flat': False
+            'postprocessor_args': [
+                '-ar', '24000', '-ac', '1'
+            ],
+            'sleep_interval': 10,
+            'max_sleep_interval': 30,
+            'sleep_requests': 1,
+            'ratelimit': 5000000,
+            'ignoreerrors': True,
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_url, download=True)
-            entries = info.get('entries', [info]) if 'entries' in info else [info]
-            
-            metadata_map = {}
-            for entry in entries:
-                if entry:
-                    e_id = entry.get('id')
-                    if e_id:
-                        metadata_map[e_id] = {
-                            'title': entry.get('title', 'Unknown Title'),
-                            'artist': entry.get('uploader', 'Unknown Artist')
-                        }
-        
-        downloaded_files = [f for f in os.listdir(temp_dir) if f.endswith('.mp3')]
-        
-        processed_count = 0
-
-        for pt_file in downloaded_files:
-            yt_id = pt_file[:-4]
-            audio_path = os.path.join(temp_dir, pt_file)
-            
-            meta = metadata_map.get(yt_id, {'title': 'Unknown Title', 'artist': 'Unknown Artist'})
-            display_name = f"{meta['artist']} - {meta['title']}"
-            
-            meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(meta, f, ensure_ascii=False)
+        extracted_info = None
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f'https://www.youtube.com/watch?v={yt_id}', download=True)
                 
-            if yt_id in audio_embeddings or yt_id in temp_embeddings:
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
-                continue
+                if info:
+                    metadata = {
+                        'title': info.get('title', 'Unknown Title'),
+                        'artist': info.get('uploader', 'Unknown Artist')
+                    }
+                    meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
+                    with open(meta_path, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, ensure_ascii=False)
             
+            if not os.path.exists(audio_path):
+                return None
+                
+            display_name = f"{metadata['artist']} - {metadata['title']}"
+
             wav_tensor, sr = torchaudio.load(audio_path)
             if wav_tensor.shape[0] > 1:
                 wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
@@ -325,21 +414,39 @@ def extract_embedding(req: UploadReq):
                 
             embed = embed[0].unsqueeze(0).cpu()
             
-            temp_embeddings[yt_id] = embed
-            temp_song_names[yt_id] = display_name
-            extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
+            extracted_info = {
+                "yt_id": yt_id,
+                "display_name": display_name,
+                "embed": embed
+            }
             
+        except Exception as e:
+            print(f"Error handling {yt_id}: {e}")
+        finally:
             if os.path.exists(audio_path):
-                os.remove(audio_path)
+                try: os.remove(audio_path)
+                except: pass
+            if os.path.exists(temp_dir):
+                try:
+                    for file in os.listdir(temp_dir):
+                        os.remove(os.path.join(temp_dir, file))
+                    os.rmdir(temp_dir)
+                except: pass
                 
-            processed_count += 1
-            
-        try:
-            os.rmdir(temp_dir)
-        except:
-            pass
-            
-        return {"processed": processed_count, "extracted": extracted_songs}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return extracted_info
+
+    max_workers = 4 
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_yt_id, yid) for yid in yt_ids]
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                if res:
+                    temp_embeddings[res["yt_id"]] = res["embed"]
+                    temp_song_names[res["yt_id"]] = res["display_name"]
+                    extracted_songs.append({"yt_id": res["yt_id"], "display_name": res["display_name"]})
+                    processed_count += 1
+            except Exception as e:
+                print(f"File processing failed: {e}")
+
+    return {"processed": processed_count, "extracted": extracted_songs}

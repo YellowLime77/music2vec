@@ -140,7 +140,7 @@ class MusicAppClient(QMainWindow):
         upload_layout = QVBoxLayout(upload_tab)
         upload_input_layout = QHBoxLayout()
         self.YouTube_id_input = QLineEdit()
-        self.YouTube_id_input.setPlaceholderText("Enter YouTube ID, URL, or Playlist URL...")
+        self.YouTube_id_input.setPlaceholderText("Enter YouTube ID, URL, YouTube Playlist URL, or Spotify URL...")
         upload_input_layout.addWidget(self.YouTube_id_input)
         self.upload_btn = QPushButton("Extract Embedding(s)")
         self.upload_btn.clicked.connect(self.upload_and_search)
@@ -182,7 +182,7 @@ class MusicAppClient(QMainWindow):
 
         self.search_tabs.addTab(song_tab, "Search by Song")
         self.search_tabs.addTab(text_tab, "Search by Text")
-        self.search_tabs.addTab(upload_tab, "Add YouTube ID")
+        self.search_tabs.addTab(upload_tab, "Upload/Add")
         layout.addWidget(self.search_tabs)
 
         layout.addWidget(QLabel("Similar Songs:"))

@@ -188,7 +188,7 @@ export default function Home() {
             <TabsList className="w-full grid grid-cols-3 h-12 p-1 bg-slate-100/80 dark:bg-slate-900 border">
               <TabsTrigger value="song" className="font-medium">Search By Song</TabsTrigger>
               <TabsTrigger value="text" className="font-medium">Search By Text</TabsTrigger>
-              <TabsTrigger value="upload" className="font-medium">+ YouTube ID</TabsTrigger>
+              <TabsTrigger value="upload" className="font-medium">+ Upload/Add</TabsTrigger>
             </TabsList>
             
             <div className="mt-4">
@@ -378,16 +378,16 @@ export default function Home() {
                   <CardHeader className="pb-4 border-b bg-slate-50/50 dark:bg-slate-900/50">
                     <CardTitle className="flex items-center gap-2 text-lg">
                       <Plus className="w-5 h-5 text-muted-foreground" />
-                      Add from YouTube
+                      Add from YouTube/Spotify
                     </CardTitle>
-                    <CardDescription>Extract embeddings from new YouTube links or IDs.</CardDescription>
+                    <CardDescription>Extract embeddings from new YouTube/Spotify links or IDs.</CardDescription>
                   </CardHeader>
                   <CardContent className="pt-6 flex flex-col gap-6">
                     
                     <div className="flex flex-col sm:flex-row gap-3">
                       <Input 
                         className="flex-1 shadow-sm"
-                        placeholder="Paste YouTube ID, URL, or Playlist here..." 
+                        placeholder="Paste YouTube ID, URL, Playlist, or Spotify URL here..." 
                         value={ytInput}
                         onChange={e => setYtInput(e.target.value)}
                       />
