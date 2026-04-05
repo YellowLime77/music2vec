@@ -17,6 +17,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>("library")
   const [status, setStatus] = useState("Connecting to Backend...")
   const [isReady, setIsReady] = useState(false)
+  const [loadProgress, setLoadProgress] = useState(0)
   const [library, setLibrary] = useState<LibraryStructure>({})
   const [clientGroups, setClientGroups] = useState<string[]>([])
 
@@ -91,6 +92,7 @@ export default function Home() {
     try {
       const resp = await axios.get(`${API_BASE_URL}/status`)
       setStatus(resp.data.status || "Unknown Status")
+      setLoadProgress(resp.data.progress || 0)
       if (resp.data.ready) {
         setIsReady(true)
       }
@@ -426,7 +428,9 @@ export default function Home() {
             {!isReady ? (
                <>
                  <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-500" />
-                 <span className="font-medium text-amber-600 dark:text-amber-400">Connecting...</span>
+                 <span className="font-medium text-amber-600 dark:text-amber-400">
+                   {status.includes("Backend") ? status : `${status} ${loadProgress > 0 ? `(${loadProgress}%)` : ''}`}
+                 </span>
                </>
             ) : status.includes("Extracting") || status.includes("Searching") ? (
                <>

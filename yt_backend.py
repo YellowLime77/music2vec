@@ -636,8 +636,8 @@ def extract_embedding(req: UploadReq):
             with spotify_lock:
                 if spotdl_client is None:
                     spotdl_client = Spotdl(
-                        client_id="ae09839d37b945c2befde3297bee7dde", 
-                        client_secret="5b6d92a5da9041d89cf3ac2fe188edc9"
+                        client_id=os.environ['SPOTIFY_CLIENT_ID'], 
+                        client_secret=os.environ['SPOTIFY_CLIENT_SECRET']
                     )
                 songs = spotdl_client.search([input_text])
                 
