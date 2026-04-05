@@ -1,0 +1,654 @@
+"use client"
+
+import React, { useState, useEffect } from "react"
+import axios from "axios"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Checkbox } from "@/components/ui/checkbox"
+import { X, Search, Plus, Play, ChevronDown, ChevronRight, Music, Info, Loader2 } from "lucide-react"
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+
+type LibraryStructure = Record<string, Record<string, string>> // {group: {ytID: title}}
+
+export default function Home() {
+  const [status, setStatus] = useState("Connecting to Backend...")
+  const [progress, setProgress] = useState(0)
+  const [isReady, setIsReady] = useState(false)
+  const [library, setLibrary] = useState<LibraryStructure>({})
+
+  // Song Search Tab
+  const [selectedGroupsForSearch, setSelectedGroupsForSearch] = useState<string[]>([])
+  const [selectedFromGroup, setSelectedFromGroup] = useState<{ [group: string]: string[] }>({})
+  const [algo, setAlgo] = useState("Multi-Centroid")
+
+  // Text Search Tab
+  const [textSearch, setTextSearch] = useState("")
+  const [selectedGroupsForTextSearch, setSelectedGroupsForTextSearch] = useState<string[]>([])
+
+  // Upload Tab
+  const [ytInput, setYtInput] = useState("")
+  const [isExtracting, setIsExtracting] = useState(false)
+  const [extractProgress, setExtractProgress] = useState(0)
+  const [selectedGroupForUpload, setSelectedGroupForUpload] = useState("")
+  const [newGroupName, setNewGroupName] = useState("")
+  const [expandedGroups, setExpandedGroups] = useState<{ [key: string]: boolean }>({})
+
+  // Results & Player
+  const [results, setResults] = useState<{yt_id: string, group: string, display_name: string, similarity: number}[]>([])
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null)
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout
+    if (!isReady) {
+      interval = setInterval(checkStatus, 1000)
+    } else {
+      fetchLibrary()
+    }
+    return () => clearInterval(interval)
+  }, [isReady])
+
+  useEffect(() => {
+    let extractInterval: NodeJS.Timeout
+    if (isExtracting) {
+      extractInterval = setInterval(checkExtractStatus, 800)
+    }
+    return () => clearInterval(extractInterval)
+  }, [isExtracting])
+
+  const checkExtractStatus = async () => {
+    try {
+      const resp = await axios.get(`${API_BASE_URL}/extract_status`)
+      if (resp.data.status && resp.data.is_extracting) {
+        setStatus(resp.data.status)
+        setExtractProgress(resp.data.progress || 0)
+      }
+    } catch (e) {
+      // Handle silently
+    }
+  }
+
+  const checkStatus = async () => {
+    try {
+      const resp = await axios.get(`${API_BASE_URL}/status`)
+      setProgress(resp.data.progress || 0)
+      setStatus(resp.data.status || "Unknown Status")
+      if (resp.data.ready) {
+        setIsReady(true)
+      }
+    } catch (e) {
+      setStatus("Failed to connect to backend...")
+    }
+  }
+
+  const fetchLibrary = async () => {
+    try {
+      const resp = await axios.get(`${API_BASE_URL}/library`)
+      setLibrary(resp.data.library || {})
+    } catch (e: any) {
+      setStatus(`Error fetching library: ${e.message}`)
+    }
+  }
+
+  const handleSearchSong = async () => {
+    const song_ids1 = selectedFromGroup["group1"] || []
+    const song_ids2 = selectedFromGroup["group2"] || []
+    const groups = selectedGroupsForSearch.length > 0 ? selectedGroupsForSearch : Object.keys(library)
+
+    if (song_ids1.length === 0 && song_ids2.length === 0) {
+      setStatus("Select at least one song.")
+      return
+    }
+
+    setStatus("Searching...")
+    try {
+      const res = await axios.post(`${API_BASE_URL}/search/song`, {
+        song_ids1,
+        song_ids2,
+        groups,
+        algo
+      })
+      setResults(res.data.results || [])
+      setStatus("Ready!")
+    } catch (e: any) {
+      setStatus(`Search failed: ${e.response?.data?.detail || e.message}`)
+    }
+  }
+
+  const handleSearchText = async () => {
+    if (!textSearch.trim()) return
+    const groups = selectedGroupsForTextSearch.length > 0 ? selectedGroupsForTextSearch : Object.keys(library)
+    
+    setStatus("Searching text...")
+    try {
+      const res = await axios.post(`${API_BASE_URL}/search/text`, {
+        text: textSearch.trim(),
+        groups
+      })
+      setResults(res.data.results || [])
+      setStatus("Ready!")
+    } catch (e: any) {
+      setStatus(`Text search failed: ${e.response?.data?.detail || e.message}`)
+    }
+  }
+
+  const handleExtract = async () => {
+    if (!ytInput.trim()) return
+    const group = newGroupName.trim() || selectedGroupForUpload || "default"
+    if (!group) {
+      setStatus("Please select or type a group name")
+      return
+    }
+
+    setIsExtracting(true)
+    setStatus(`Extracting embeddings for ${ytInput}...`)
+    try {
+      const res = await axios.post(`${API_BASE_URL}/extract`, { 
+        query: ytInput.trim(),
+        group
+      }, { timeout: 300000 })
+      setStatus(`Added ${res.data.processed} song(s) to ${group}.`)
+      setYtInput("")
+      setNewGroupName("")
+      fetchLibrary()
+    } catch (e: any) {
+      setStatus(`Upload failed: ${e.response?.data?.detail || e.message}`)
+    } finally {
+      setIsExtracting(false)
+    }
+  }
+
+  const handleRemoveSongs = async (group: string, ytIds: string[]) => {
+    if (ytIds.length === 0) return
+    setStatus(`Removing ${ytIds.length} song(s) from ${group}...`)
+    try {
+      const res = await axios.post(`${API_BASE_URL}/remove_songs`, {
+        yt_ids: ytIds,
+        group
+      })
+      setStatus(`Removed ${res.data.removed} song(s) from ${group}.`)
+      fetchLibrary()
+    } catch (e: any) {
+      setStatus(`Failed to remove: ${e.response?.data?.detail || e.message}`)
+    }
+  }
+
+  const toggleGroupSelection = (group: string, isChecked: boolean, setter: React.Dispatch<React.SetStateAction<string[]>>, list: string[]) => {
+    if (isChecked) {
+      setter([...list, group])
+    } else {
+      setter(list.filter(g => g !== group))
+    }
+  }
+
+  const toggleGroupExpanded = (group: string) => {
+    setExpandedGroups(prev => ({
+      ...prev,
+      [group]: !prev[group]
+    }))
+  }
+
+  const toggleSongSelection = (group: string, songId: string) => {
+    setSelectedFromGroup(prev => {
+      const current = prev[group] || []
+      if (current.includes(songId)) {
+        return {
+          ...prev,
+          [group]: current.filter(id => id !== songId)
+        }
+      } else {
+        return {
+          ...prev,
+          [group]: [...current, songId]
+        }
+      }
+    })
+  }
+
+  const allGroups = Object.keys(library)
+
+  return (
+    <div className="min-h-screen bg-slate-50/50 dark:bg-slate-950 pb-12">
+      {/* Header */}
+      <header className="sticky top-0 z-10 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md border-b shadow-sm w-full mb-6">
+        <div className="container mx-auto px-4 max-w-7xl h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="bg-primary/10 p-2 rounded-lg">
+              <Music className="w-5 h-5 text-primary" />
+            </div>
+            <h1 className="font-bold tracking-tight text-xl">Music2Vec <span className="text-muted-foreground font-normal">Explorer</span></h1>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="text-sm font-medium flex items-center gap-2 bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-full">
+              {!isReady && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
+              <span className={status.includes("Ready") || status.includes("Added") || status.includes("Removed") ? "text-primary" : "text-muted-foreground"}>{status}</span>
+            </div>
+            {!isReady && (
+              <div className="w-24 px-2 hidden sm:block">
+                <Progress value={progress} className="h-2" />
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <div className="container mx-auto px-4 max-w-7xl flex flex-col lg:flex-row gap-6">
+        
+        {/* Left Column: Search & Controls */}
+        <div className="flex-1 min-w-0 flex flex-col gap-6">
+          <Tabs defaultValue="library" className="w-full">
+            <TabsList className="w-full grid grid-cols-4 h-10 p-1 bg-slate-100/80 dark:bg-slate-900 border">
+              <TabsTrigger value="library" className="text-xs sm:text-sm">Library</TabsTrigger>
+              <TabsTrigger value="song" className="text-xs sm:text-sm">Search Song</TabsTrigger>
+              <TabsTrigger value="text" className="text-xs sm:text-sm">Search Text</TabsTrigger>
+              <TabsTrigger value="upload" className="text-xs sm:text-sm">+ Upload</TabsTrigger>
+            </TabsList>
+            
+            <div className="mt-4">
+              {/* Library Tab */}
+              <TabsContent value="library" className="m-0">
+                <Card className="border shadow-sm">
+                  <CardHeader className="pb-4 border-b bg-slate-50/50 dark:bg-slate-900/50">
+                    <CardTitle className="text-lg">Music Library</CardTitle>
+                    <CardDescription>Browse and manage your music groups.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pt-6">
+                    {allGroups.length === 0 ? (
+                      <div className="text-center py-12 text-muted-foreground">
+                        <Music className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                        <p className="text-sm">No groups yet. Upload songs to create groups.</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {allGroups.map(group => {
+                          const isExpanded = expandedGroups[group] ?? true
+                          const songs = library[group]
+                          const songCount = Object.keys(songs).length
+
+                          return (
+                            <div key={group} className="border rounded-lg overflow-hidden">
+                              <button
+                                className="w-full flex items-center justify-between p-4 hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors"
+                                onClick={() => toggleGroupExpanded(group)}
+                              >
+                                <div className="flex items-center gap-3 flex-1 min-w-0">
+                                  {isExpanded ? (
+                                    <ChevronDown className="w-4 h-4 shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="w-4 h-4 shrink-0" />
+                                  )}
+                                  <span className="font-medium">{group}</span>
+                                  <span className="text-xs text-muted-foreground bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">{songCount}</span>
+                                </div>
+                              </button>
+                              {isExpanded && (
+                                <div className="border-t bg-slate-50/50 dark:bg-slate-900/20">
+                                  <ScrollArea className="h-48">
+                                    <div className="p-2 space-y-1">
+                                      {Object.entries(songs).map(([ytID, title]) => (
+                                        <div key={ytID} className="flex items-center justify-between p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded group">
+                                          <span className="text-sm truncate flex-1 min-w-0" title={title}>{title}</span>
+                                          <button
+                                            className="shrink-0 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 p-1 rounded transition-all"
+                                            onClick={() => handleRemoveSongs(group, [ytID])}
+                                            title="Remove song"
+                                          >
+                                            <X className="w-3 h-3" />
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </ScrollArea>
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              </TabsContent>
+              
+              {/* Song Search Tab */}
+              <TabsContent value="song" className="m-0">
+                <Card className="border shadow-sm">
+                  <CardHeader className="pb-4 border-b bg-slate-50/50 dark:bg-slate-900/50">
+                    <CardTitle className="text-lg">Search by Song</CardTitle>
+                    <CardDescription>Select songs from groups to find similar tracks.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pt-6 space-y-6">
+                    {/* Group Filter */}
+                    <div className="space-y-3">
+                      <label className="text-sm font-medium">Search in Groups:</label>
+                      <div className="space-y-2 p-3 border rounded-lg bg-slate-50 dark:bg-slate-900/30">
+                        <div className="flex items-center space-x-2">
+                          <Checkbox
+                            id="all-groups"
+                            checked={selectedGroupsForSearch.length === allGroups.length && allGroups.length > 0}
+                            onCheckedChange={(checked) => {
+                              if (checked) {
+                                setSelectedGroupsForSearch(allGroups)
+                              } else {
+                                setSelectedGroupsForSearch([])
+                              }
+                            }}
+                          />
+                          <label htmlFor="all-groups" className="text-sm font-medium cursor-pointer">All Groups</label>
+                        </div>
+                        <div className="border-t pt-2 space-y-2">
+                          {allGroups.map(group => (
+                            <div key={group} className="flex items-center space-x-2">
+                              <Checkbox
+                                id={`group-${group}`}
+                                checked={selectedGroupsForSearch.includes(group)}
+                                onCheckedChange={(checked) => toggleGroupSelection(group, checked as boolean, setSelectedGroupsForSearch, selectedGroupsForSearch)}
+                              />
+                              <label htmlFor={`group-${group}`} className="text-sm cursor-pointer">{group}</label>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Song Selection */}
+                    <div className="space-y-3">
+                      <label className="text-sm font-medium">Songs to Search:</label>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        {["group1", "group2"].map(groupKey => (
+                          <div key={groupKey} className="border rounded-lg overflow-hidden bg-slate-50/50 dark:bg-slate-900/30">
+                            <div className="px-4 py-2 bg-slate-100 dark:bg-slate-800 border-b">
+                              <div className="flex justify-between items-center">
+                                <span className="text-sm font-semibold">{groupKey === "group1" ? "Primary" : "Secondary"} Query</span>
+                                {(selectedFromGroup[groupKey]?.length || 0) > 0 && (
+                                  <Button variant="ghost" size="sm" className="h-6 text-xs" onClick={() => setSelectedFromGroup(prev => ({ ...prev, [groupKey]: [] }))}>
+                                    Clear
+                                  </Button>
+                                )}
+                              </div>
+                            </div>
+                            <ScrollArea className="h-40">
+                              <div className="p-2 space-y-1">
+                                {allGroups.map(group =>
+                                  Object.entries(library[group] || {}).map(([ytID, title]) => (
+                                    <div
+                                      key={`${group}-${ytID}`}
+                                      className={`p-2 cursor-pointer rounded text-xs truncate transition-colors ${
+                                        selectedFromGroup[groupKey]?.includes(ytID)
+                                          ? "bg-primary/10 text-primary font-medium"
+                                          : "hover:bg-slate-200 dark:hover:bg-slate-800"
+                                      }`}
+                                      onClick={() => toggleSongSelection(groupKey, ytID)}
+                                    >
+                                      {title}
+                                    </div>
+                                  ))
+                                )}
+                                {Object.entries(library).length === 0 && (
+                                  <div className="text-center text-xs text-muted-foreground p-4">No songs available</div>
+                                )}
+                              </div>
+                            </ScrollArea>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Algorithm */}
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-medium text-muted-foreground">Algorithm:</span>
+                      <Select value={algo} onValueChange={setAlgo}>
+                        <SelectTrigger className="w-[180px]">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="Multi-Centroid">Multi-Centroid</SelectItem>
+                          <SelectItem value="Average Vector">Average Vector</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    {/* Search Button */}
+                    <Button onClick={handleSearchSong} disabled={!isReady} className="w-full gap-2">
+                      <Search className="w-4 h-4" />
+                      Find Similar Songs
+                    </Button>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+              
+              {/* Text Search Tab */}
+              <TabsContent value="text" className="m-0">
+                <Card className="border shadow-sm">
+                  <CardHeader className="pb-4 border-b bg-slate-50/50 dark:bg-slate-900/50">
+                    <CardTitle className="text-lg">Search by Text</CardTitle>
+                    <CardDescription>Describe the music you're looking for.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pt-6 space-y-6">
+                    {/* Group Filter */}
+                    <div className="space-y-3">
+                      <label className="text-sm font-medium">Search in Groups:</label>
+                      <div className="space-y-2 p-3 border rounded-lg bg-slate-50 dark:bg-slate-900/30">
+                        <div className="flex items-center space-x-2">
+                          <Checkbox
+                            id="all-groups-text"
+                            checked={selectedGroupsForTextSearch.length === allGroups.length && allGroups.length > 0}
+                            onCheckedChange={(checked) => {
+                              if (checked) {
+                                setSelectedGroupsForTextSearch(allGroups)
+                              } else {
+                                setSelectedGroupsForTextSearch([])
+                              }
+                            }}
+                          />
+                          <label htmlFor="all-groups-text" className="text-sm font-medium cursor-pointer">All Groups</label>
+                        </div>
+                        <div className="border-t pt-2 space-y-2">
+                          {allGroups.map(group => (
+                            <div key={group} className="flex items-center space-x-2">
+                              <Checkbox
+                                id={`group-text-${group}`}
+                                checked={selectedGroupsForTextSearch.includes(group)}
+                                onCheckedChange={(checked) => toggleGroupSelection(group, checked as boolean, setSelectedGroupsForTextSearch, selectedGroupsForTextSearch)}
+                              />
+                              <label htmlFor={`group-text-${group}`} className="text-sm cursor-pointer">{group}</label>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Text Input */}
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Search Query:</label>
+                      <Input
+                        className="text-base h-12"
+                        placeholder="e.g., 'upbeat acoustic guitar with strong vocals'"
+                        value={textSearch}
+                        onChange={e => setTextSearch(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleSearchText()}
+                      />
+                    </div>
+
+                    {/* Search Button */}
+                    <Button onClick={handleSearchText} disabled={!isReady || !textSearch.trim()} className="w-full gap-2">
+                      <Search className="w-4 h-4" />
+                      Search
+                    </Button>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+              
+              {/* Upload Tab */}
+              <TabsContent value="upload" className="m-0">
+                <Card className="border shadow-sm">
+                  <CardHeader className="pb-4 border-b bg-slate-50/50 dark:bg-slate-900/50">
+                    <CardTitle className="flex items-center gap-2 text-lg">
+                      <Plus className="w-5 h-5" />
+                      Upload/Extract
+                    </CardTitle>
+                    <CardDescription>Add songs from YouTube or Spotify to a group.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="pt-6 space-y-6">
+                    {/* URL/ID Input */}
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">YouTube/Spotify URL or ID:</label>
+                      <Input
+                        placeholder="Paste YouTube ID, URL, Playlist, or Spotify URL..."
+                        value={ytInput}
+                        onChange={e => setYtInput(e.target.value)}
+                      />
+                    </div>
+
+                    {/* Group Selection */}
+                    <div className="space-y-3">
+                      <label className="text-sm font-medium">Select or Create Group:</label>
+                      <div className="space-y-2">
+                        {allGroups.length > 0 && (
+                          <Select value={selectedGroupForUpload} onValueChange={setSelectedGroupForUpload}>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Choose existing group" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {allGroups.map(group => (
+                                <SelectItem key={group} value={group}>{group}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        <div className="relative">
+                          <Input
+                            placeholder="Or type new group name..."
+                            value={newGroupName}
+                            onChange={e => setNewGroupName(e.target.value)}
+                            className={newGroupName ? "border-primary" : ""}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Extract Progress */}
+                    {isExtracting && (
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-xs text-muted-foreground">
+                          <span>{status}</span>
+                          <span>{extractProgress}%</span>
+                        </div>
+                        <Progress value={extractProgress} className="h-2" />
+                      </div>
+                    )}
+
+                    {/* Extract Button */}
+                    <Button onClick={handleExtract} disabled={!isReady || isExtracting || !ytInput.trim() || !(newGroupName.trim() || selectedGroupForUpload)} className="w-full gap-2">
+                      {isExtracting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                      Extract Audio
+                    </Button>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            </div>
+          </Tabs>
+        </div>
+
+        {/* Right Column: Player & Results */}
+        <div className="w-full lg:w-[400px] xl:w-[450px] flex flex-col gap-6 shrink-0 min-w-0">
+          
+          <Card className={`overflow-hidden shadow-lg border transition-all duration-300 ${activeVideoId ? 'border-primary/50 shadow-primary/10' : 'border-dashed bg-slate-50/50 dark:bg-slate-900/50 shadow-sm'}`}>
+            <CardHeader className="py-2.5 px-4 bg-slate-100/50 dark:bg-slate-900 border-b flex flex-row items-center justify-between">
+              <CardTitle className="text-sm font-semibold flex items-center gap-2">
+                <Play className="w-4 h-4 text-primary" />
+                Player
+              </CardTitle>
+              {activeVideoId && (
+                <Button variant="ghost" className="h-7 w-7 p-0 rounded-full" onClick={() => setActiveVideoId(null)}>
+                  <X className="w-4 h-4" />
+                </Button>
+              )}
+            </CardHeader>
+            <CardContent className="p-0">
+              {activeVideoId ? (
+                <div className="aspect-video w-full bg-black relative">
+                  <iframe
+                    width="100%"
+                    height="100%"
+                    src={`https://www.youtube.com/embed/${activeVideoId}?autoplay=1`}
+                    title="YouTube video player"
+                    frameBorder="0"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                    className="absolute inset-0"
+                  ></iframe>
+                </div>
+              ) : (
+                <div className="aspect-video w-full flex items-center justify-center bg-slate-100/30 dark:bg-slate-900/30">
+                  <div className="flex flex-col items-center gap-2 text-muted-foreground opacity-60">
+                    <Music className="w-8 h-8" />
+                    <p className="text-sm font-medium">No active video</p>
+                    <p className="text-xs">Click a result to play</p>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card className="flex-1 min-h-[500px] flex flex-col shadow-md border">
+            <CardHeader className="py-3 px-4 bg-slate-50 dark:bg-slate-900/50 border-b">
+              <CardTitle className="text-base font-semibold flex items-center gap-2">
+                <Info className="w-4 h-4 text-primary" />
+                Results
+              </CardTitle>
+              <CardDescription className="text-xs">Top matches for your query.</CardDescription>
+            </CardHeader>
+            <CardContent className="flex-1 p-0 bg-background relative">
+              <ScrollArea className="h-full absolute inset-0">
+                {results.length > 0 ? (
+                  <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {results.map((res, i) => {
+                      const isActive = activeVideoId === res.yt_id
+                      return (
+                        <div
+                          key={`${res.yt_id}-${i}`}
+                          className={`p-4 text-sm cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900 flex flex-col gap-1.5 transition-colors group/result ${
+                            isActive ? 'border-l-4 border-l-primary bg-slate-50 dark:bg-slate-900' : 'border-l-4 border-l-transparent'
+                          }`}
+                          onClick={() => setActiveVideoId(res.yt_id)}
+                        >
+                          <div className="flex justify-between items-start gap-3">
+                            <div className="flex-1 min-w-0">
+                              <span className={`block font-medium line-clamp-2 ${isActive ? 'text-primary' : 'text-foreground group-hover/result:text-primary transition-colors'}`}>
+                                {res.display_name}
+                              </span>
+                              <span className="text-xs text-muted-foreground mt-0.5">{res.group}</span>
+                            </div>
+                            <div className="shrink-0 bg-slate-100 dark:bg-slate-800 text-slate-500 font-mono text-[10px] px-1.5 py-0.5 rounded border">
+                              {(res.similarity * 100).toFixed(1)}%
+                            </div>
+                          </div>
+                          <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1">
+                            <div className="bg-primary h-1 rounded-full" style={{ width: `${Math.max(0, res.similarity * 100)}%` }} />
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-12 text-center text-muted-foreground opacity-60 h-full">
+                    <Search className="w-8 h-8 mb-3" />
+                    <p className="text-sm font-medium">No results to display.</p>
+                    <p className="text-xs mt-1">Run a search to find similar songs.</p>
+                  </div>
+                )}
+              </ScrollArea>
+            </CardContent>
+          </Card>
+        </div>
+
+      </div>
+    </div>
+  )
+}

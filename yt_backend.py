@@ -1,12 +1,15 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
 import json
+import re
+from urllib.parse import quote_plus
 import torch
 import torchaudio
 import yt_dlp
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from spotdl import Spotdl
 from muq import MuQMuLan
@@ -25,16 +28,121 @@ app.add_middleware(
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 CACHE_DIR = 'yt_embeddings_cache'
 
+# Optional yt-dlp auth env vars:
+# - YTDLP_COOKIES_FILE: absolute/relative path to exported cookies.txt
+# - YTDLP_COOKIES_FROM_BROWSER: e.g. chrome or chrome,Default
+# - YTDLP_USER_AGENT: optional custom UA string
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+YTDLP_USER_AGENT = os.getenv("YTDLP_USER_AGENT", "").strip()
+PLAYLIST_ITEM_DELAY_MS = max(0, int(os.getenv("PLAYLIST_ITEM_DELAY_MS", "500")))
+
+PERMANENT_YTDLP_ERROR_HINTS = [
+    "this video is not available",
+    "private video",
+    "members-only",
+    "video unavailable",
+    "has been removed",
+]
+
+# Lightweight resolver cache to avoid repeated remote lookups for common queries.
+query_resolution_cache: Dict[str, List[Dict[str, Any]]] = {}
+query_resolution_lock = threading.Lock()
+video_metadata_cache: Dict[str, Dict[str, Any]] = {}
+video_metadata_lock = threading.Lock()
+
+def with_yt_dlp_auth(base_opts: Dict[str, Any]) -> Dict[str, Any]:
+    opts = dict(base_opts)
+
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        opts['cookiefile'] = YTDLP_COOKIES_FILE
+    elif YTDLP_COOKIES_FROM_BROWSER:
+        browser_parts = [p.strip() for p in YTDLP_COOKIES_FROM_BROWSER.split(',') if p.strip()]
+        if browser_parts:
+            opts['cookiesfrombrowser'] = tuple(browser_parts)
+
+    if YTDLP_USER_AGENT:
+        opts['http_headers'] = {
+            **opts.get('http_headers', {}),
+            'User-Agent': YTDLP_USER_AGENT,
+        }
+
+    return opts
+
+def yt_dlp_extract_info(url: str, base_opts: Dict[str, Any], download: bool):
+    """Run yt-dlp with auth fallbacks to reduce YouTube bot-check failures."""
+    attempts: List[Dict[str, Any]] = []
+
+    # 1) Primary configuration (env-driven auth + headers).
+    attempts.append(with_yt_dlp_auth(base_opts))
+
+    # 2) If no explicit auth configured, try common browsers automatically.
+    if not YTDLP_COOKIES_FILE and not YTDLP_COOKIES_FROM_BROWSER:
+        for browser in ("chrome", "edge", "firefox"):
+            alt = dict(base_opts)
+            alt['cookiesfrombrowser'] = (browser,)
+            if YTDLP_USER_AGENT:
+                alt['http_headers'] = {
+                    **alt.get('http_headers', {}),
+                    'User-Agent': YTDLP_USER_AGENT,
+                }
+            attempts.append(alt)
+
+    last_error: Optional[Exception] = None
+    for opts in attempts:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=download)
+        except Exception as e:
+            last_error = e
+            err_text = str(e).lower()
+            if any(hint in err_text for hint in PERMANENT_YTDLP_ERROR_HINTS):
+                # Stop retry loops for permanent failures; fallback attempts won't help.
+                raise e
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("yt-dlp failed without a captured exception")
+
 # Global state
 mulan = None
-audio_embeddings = {}
-song_metadata = {}
-temp_embeddings = {}
-temp_song_names = {}
+spotdl_client = None
+spotify_lock = threading.Lock()
+audio_embeddings = {}  # {group_name: {yt_id: embed}}
+song_metadata = {}  # {group_name: {yt_id: display_name}}
 is_ready = False
 load_progress = 0
 load_status = "Not started"
 model_lock = threading.Lock()
+
+# Extraction progress state
+extract_state = {
+    "is_extracting": False,
+    "status": "Idle",
+    "progress": 0,
+    "current": 0,
+    "total": 0
+}
+extract_lock = threading.Lock()
+
+@app.get("/extract_status")
+def get_extract_status():
+    return extract_state
+
+def update_extract_state(status=None, current=None, total=None, is_extracting=None):
+    with extract_lock:
+        if is_extracting is not None:
+            extract_state["is_extracting"] = is_extracting
+        if status is not None:
+            extract_state["status"] = status
+        if total is not None:
+            extract_state["total"] = total
+        if current is not None:
+            extract_state["current"] = current
+            if extract_state["total"] > 0:
+                extract_state["progress"] = int((extract_state["current"] / extract_state["total"]) * 100)
+            else:
+                extract_state["progress"] = 0
 
 def load_data():
     global mulan, audio_embeddings, song_metadata, is_ready, load_progress, load_status
@@ -60,19 +168,26 @@ def load_data():
             yt_id = pt_file[:-3]
             
             display_name = yt_id
+            groups = ["default"]
             meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
             if os.path.exists(meta_path):
                 try:
                     with open(meta_path, 'r', encoding='utf-8') as f:
                         meta = json.load(f)
                         display_name = f"{meta.get('artist', 'Unknown')} - {meta.get('title', 'Unknown')}"
+                        groups = meta.get('groups', [meta.get('group', 'default')])
                 except Exception:
                     pass
             
             try:
                 embed = torch.load(cache_path, map_location=device, weights_only=True)
-                audio_embeddings[yt_id] = embed
-                song_metadata[yt_id] = display_name
+                for g in groups:
+                    if g not in audio_embeddings:
+                        audio_embeddings[g] = {}
+                    if g not in song_metadata:
+                        song_metadata[g] = {}
+                    audio_embeddings[g][yt_id] = embed
+                    song_metadata[g][yt_id] = display_name
             except Exception as e:
                 print(f"Error loading {pt_file}: {e}")
                 
@@ -91,20 +206,17 @@ async def startup_event():
 
 @app.get("/status")
 def get_status():
+    total_embeddings = sum(len(group) for group in audio_embeddings.values())
     return {
         "ready": is_ready,
         "progress": load_progress,
         "status": load_status,
-        "library_size": len(audio_embeddings),
-        "temp_size": len(temp_embeddings)
+        "library_size": total_embeddings
     }
 
 @app.get("/library")
 def get_library():
-    return {
-        "library": song_metadata,
-        "temp_library": temp_song_names
-    }
+    return {"library": song_metadata}
 
 def combine_embeddings(embeds, algo: str):
     if not embeds:
@@ -137,88 +249,112 @@ def combine_embeddings(embeds, algo: str):
         centroids = torch.stack(new_centroids)
     return centroids
 
-def calc_similarities(target_embed, exclude_set, embeddings_dict, metadata_dict):
+def calc_similarities(target_embed, exclude_set, embeddings_dict, metadata_dict, groups=None):
     results = []
-    for song_id, embed in embeddings_dict.items():
-        if song_id in exclude_set:
+    seen = set(exclude_set)
+    if groups is None or len(groups) == 0:
+        groups = list(embeddings_dict.keys())
+    for group in groups:
+        if group not in embeddings_dict:
             continue
-        embed = embed.to(device)
-        if target_embed.size(0) > 1:
-            sims = [torch.nn.functional.cosine_similarity(c.unsqueeze(0), embed, dim=-1).item() for c in target_embed]
-            sim = max(sims)
-        else:
-            sim = torch.nn.functional.cosine_similarity(target_embed, embed, dim=-1).item()
-            
-        results.append({
-            "yt_id": song_id,
-            "display_name": metadata_dict.get(song_id, song_id),
-            "similarity": sim
-        })
+        for song_id, embed in embeddings_dict[group].items():
+            if song_id in seen:
+                continue
+            seen.add(song_id)
+            embed = embed.to(device)
+            if target_embed.size(0) > 1:
+                sims = [torch.nn.functional.cosine_similarity(c.unsqueeze(0), embed, dim=-1).item() for c in target_embed]
+                sim = max(sims)
+            else:
+                sim = torch.nn.functional.cosine_similarity(target_embed, embed, dim=-1).item()
+                
+            results.append({
+                "yt_id": song_id,
+                "group": group,
+                "display_name": metadata_dict.get(group, {}).get(song_id, song_id),
+                "similarity": sim
+            })
     results.sort(key=lambda x: x["similarity"], reverse=True)
     return results
 
 class SearchSongReq(BaseModel):
-    group1: List[str]
-    group2: List[str] = []
+    song_ids1: List[str]
+    song_ids2: List[str] = Field(default_factory=list)
+    groups: List[str] = Field(default_factory=list)
     algo: str = "Multi-Centroid"
-    use_temp: bool = False
 
 @app.post("/search/song")
 def search_song(req: SearchSongReq):
     if not is_ready:
         raise HTTPException(status_code=503, detail="Backend not ready yet")
-        
-    src_embeddings = temp_embeddings if req.use_temp else audio_embeddings
     
-    valid_songs_1 = [name for name in req.group1 if name in src_embeddings]
-    valid_songs_2 = [name for name in req.group2 if name in src_embeddings]
+    search_groups = req.groups if req.groups else list(audio_embeddings.keys())
+    
+    valid_songs_1 = []
+    valid_songs_2 = []
+    for group in search_groups:
+        if group in audio_embeddings:
+            valid_songs_1.extend([sid for sid in req.song_ids1 if sid in audio_embeddings[group]])
+            valid_songs_2.extend([sid for sid in req.song_ids2 if sid in audio_embeddings[group]])
     
     if not valid_songs_1 and not valid_songs_2:
-        raise HTTPException(status_code=400, detail="No valid songs provided")
-        
-    embeds1 = [src_embeddings[name] for name in valid_songs_1]
-    embeds2 = [src_embeddings[name] for name in valid_songs_2]
+        raise HTTPException(status_code=400, detail="No valid songs found in specified groups")
+    
+    embeds_to_search = []
+    for song_id in valid_songs_1 + valid_songs_2:
+        for group in search_groups:
+            if group in audio_embeddings and song_id in audio_embeddings[group]:
+                embeds_to_search.append(audio_embeddings[group][song_id])
+                break
+    
+    embeds1 = embeds_to_search[:len(valid_songs_1)] if valid_songs_1 else []
+    embeds2 = embeds_to_search[len(valid_songs_1):] if valid_songs_2 else []
     
     target_embed_1 = combine_embeddings(embeds1, req.algo) if embeds1 else None
     target_embed_2 = combine_embeddings(embeds2, req.algo) if embeds2 else None
     
     exclude_songs = set(valid_songs_1 + valid_songs_2)
     
-    # We compare against the main audio_embeddings database
     results = []
-    for song_id, embed in audio_embeddings.items():
-        if song_id in exclude_songs:
+    for group in search_groups:
+        if group not in audio_embeddings:
             continue
+        for song_id, embed in audio_embeddings[group].items():
+            if song_id in exclude_songs:
+                continue
+            exclude_songs.add(song_id)
+                
+            embed = embed.to(device)
+            def sim(tgt):
+                if tgt is None: return 0
+                if tgt.size(0) > 1:
+                    return max([torch.nn.functional.cosine_similarity(c.unsqueeze(0), embed, dim=-1).item() for c in tgt])
+                return torch.nn.functional.cosine_similarity(tgt, embed, dim=-1).item()
+                
+            s1 = sim(target_embed_1)
+            s2 = sim(target_embed_2)
             
-        embed = embed.to(device)
-        def sim(tgt):
-            if tgt is None: return 0
-            if tgt.size(0) > 1:
-                return max([torch.nn.functional.cosine_similarity(c.unsqueeze(0), embed, dim=-1).item() for c in tgt])
-            return torch.nn.functional.cosine_similarity(tgt, embed, dim=-1).item()
-            
-        s1 = sim(target_embed_1)
-        s2 = sim(target_embed_2)
-        
-        sim_val = 0
-        if target_embed_1 is not None and target_embed_2 is not None:
-            sim_val = 0.5 * s1 + 0.5 * s2
-        elif target_embed_1 is not None:
-            sim_val = s1
-        else:
-            sim_val = s2
-            
-        results.append({
-            "yt_id": song_id,
-            "display_name": song_metadata.get(song_id, song_id),
-            "similarity": sim_val
-        })
+            sim_val = 0
+            if target_embed_1 is not None and target_embed_2 is not None:
+                sim_val = 0.5 * s1 + 0.5 * s2
+            elif target_embed_1 is not None:
+                sim_val = s1
+            else:
+                sim_val = s2
+                
+            results.append({
+                "yt_id": song_id,
+                "group": group,
+                "display_name": song_metadata.get(group, {}).get(song_id, song_id),
+                "similarity": sim_val
+            })
         
     results.sort(key=lambda x: x["similarity"], reverse=True)
     return {"results": results[:100]}
 
 class SearchTextReq(BaseModel):
     text: str
+    groups: List[str] = Field(default_factory=list)
 
 @app.post("/search/text")
 def search_text(req: SearchTextReq):
@@ -232,58 +368,345 @@ def search_text(req: SearchTextReq):
         with model_lock:
             text_embed = mulan(texts=[req.text.strip()]).to(device)
             
-    results = calc_similarities(text_embed, set(), audio_embeddings, song_metadata)
+    results = calc_similarities(text_embed, set(), audio_embeddings, song_metadata, groups=req.groups)
     return {"results": results[:100]}
 
-class UploadReq(BaseModel):
+def is_youtube_reference(input_text: str) -> bool:
+    if not input_text:
+        return False
+    if "youtube.com" in input_text or "youtu.be" in input_text or "list=" in input_text:
+        return True
+    # Common plain YouTube video ID format.
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", input_text.strip()))
+
+def get_yt_video_metadata(yt_id: str) -> Optional[Dict[str, Any]]:
+    with video_metadata_lock:
+        cached = video_metadata_cache.get(yt_id)
+    if cached is not None:
+        return cached
+
+    probe_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'skip_download': True,
+    }
+
+    try:
+        info = yt_dlp_extract_info(f"https://www.youtube.com/watch?v={yt_id}", probe_opts, download=False)
+        if not info or not info.get('id'):
+            return None
+
+        metadata = {
+            'yt_id': yt_id,
+            'title': info.get('title') or 'Unknown Title',
+            'artist': info.get('uploader') or info.get('channel') or info.get('artist') or info.get('creator') or 'Unknown Artist',
+            'duration': info.get('duration'),
+            'url': f"https://www.youtube.com/watch?v={yt_id}",
+        }
+        with video_metadata_lock:
+            video_metadata_cache[yt_id] = metadata
+        return metadata
+    except Exception:
+        return None
+
+def search_ytmusic_song_candidates(query: str, limit: int = 5, hydrate_metadata: bool = False):
+    if not query.strip():
+        return []
+
+    cache_key = f"{query.strip().lower()}::{limit}::{int(hydrate_metadata)}"
+    with query_resolution_lock:
+        cached = query_resolution_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    search_url = f"https://music.youtube.com/search?q={quote_plus(query)}#songs"
+
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'skip_download': True,
+        'playlistend': max(10, limit * 3),
+        'extractor_args': {
+            'youtube': {
+                'music_search': ['songs']
+            }
+        },
+        'cookiefile': 'cookies.txt'
+    }
+
+    try:
+        info = yt_dlp_extract_info(search_url, ydl_opts, download=False)
+    except Exception:
+        fallback_opts = {
+            'extract_flat': True,
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'skip_download': True,
+        }
+        info = yt_dlp_extract_info(search_url, fallback_opts, download=False)
+
+    entries = info.get('entries', []) if info else []
+
+    # If YT Music search yields no entries, fallback to plain YouTube search.
+    if not entries:
+        try:
+            generic = yt_dlp_extract_info(
+                f"ytsearch{max(5, limit * 3)}:{query}",
+                {
+                    'extract_flat': True,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'ignoreerrors': True,
+                    'skip_download': True,
+                },
+                download=False,
+            )
+            entries = generic.get('entries', []) if generic else []
+        except Exception:
+            entries = []
+
+    candidates = []
+    for entry in entries:
+        if not entry:
+            continue
+
+        yt_id = entry.get('id')
+        if not yt_id:
+            continue
+
+        title = entry.get('title') or 'Unknown Title'
+        artist = entry.get('uploader') or entry.get('channel') or entry.get('artist') or 'Unknown Artist'
+        duration = entry.get('duration')
+
+        haystack = f"{title} {artist}".lower()
+        if any(token in haystack for token in ['playlist', 'full album', 'album stream', ' dj mix ', 'hour mix']):
+            continue
+        if duration and duration > 15 * 60:
+            continue
+
+        candidates.append({
+            'yt_id': yt_id,
+            'title': title,
+            'artist': artist,
+            'duration': duration,
+            'url': f"https://www.youtube.com/watch?v={yt_id}"
+        })
+
+    limited = candidates[:max(1, limit)]
+
+    if hydrate_metadata and limited:
+        hydrated_by_id: Dict[str, Dict[str, Any]] = {}
+        workers = min(4, len(limited))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(get_yt_video_metadata, c['yt_id']): c['yt_id']
+                for c in limited
+            }
+            for future in as_completed(future_map):
+                yt_id = future_map[future]
+                try:
+                    enriched = future.result()
+                    if enriched:
+                        hydrated_by_id[yt_id] = enriched
+                except Exception:
+                    pass
+
+        rebuilt = []
+        for c in limited:
+            enriched = hydrated_by_id.get(c['yt_id'])
+            if not enriched:
+                rebuilt.append(c)
+                continue
+            rebuilt.append({
+                'yt_id': c['yt_id'],
+                'title': enriched.get('title') or c.get('title') or 'Unknown Title',
+                'artist': enriched.get('artist') or c.get('artist') or 'Unknown Artist',
+                'duration': enriched.get('duration', c.get('duration')),
+                'url': enriched.get('url') or c.get('url') or f"https://www.youtube.com/watch?v={c['yt_id']}",
+            })
+        limited = rebuilt
+
+    with query_resolution_lock:
+        query_resolution_cache[cache_key] = limited
+    return limited
+
+def resolve_query_to_yt_id(query: str, candidate_limit: int = 3) -> Optional[str]:
+    search_url = f"https://music.youtube.com/search?q={quote_plus(query)}#songs"
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'skip_download': True,
+        'playlistend': 10,
+        'extractor_args': {
+            'youtube': {
+                'music_search': ['songs']
+            }
+        }
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_url, download=False)
+            entries = info.get('entries', []) if info else []
+            
+            if not entries:
+                generic_opts = dict(ydl_opts)
+                del generic_opts['extractor_args']
+                info = ydl.extract_info(f"ytsearch5:{query}", generic_opts, download=False)
+                entries = info.get('entries', []) if info else []
+            
+            for entry in entries:
+                if not entry or not entry.get('id'):
+                    continue
+                
+                title = entry.get('title', '').lower()
+                artist = (entry.get('uploader') or entry.get('channel') or entry.get('artist') or '').lower()
+                duration = entry.get('duration')
+                
+                haystack = f"{title} {artist}"
+                if any(token in haystack for token in ['playlist', 'full album', 'album stream', ' dj mix ', 'hour mix']):
+                    continue
+                if duration and duration > 15 * 60:
+                    continue
+                    
+                return entry['id']
+    except Exception as e:
+        print(f"Error resolving {query}: {e}")
+    return None
+
+class SearchYTMusicReq(BaseModel):
     query: str
+    limit: int = 5
+
+@app.post("/ytmusic/search")
+def search_ytmusic(req: SearchYTMusicReq):
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Empty query")
+
+    safe_limit = max(1, min(req.limit, 5))
+    try:
+        return {"results": search_ytmusic_song_candidates(query, safe_limit)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YouTube Music search failed: {str(e)}")
+
+class UploadReq(BaseModel):
+    query: str = ""
+    group: str = "default"
+    selected_yt_id: Optional[str] = None
+    playlist_queries: List[str] = Field(default_factory=list)
 
 @app.post("/extract")
 def extract_embedding(req: UploadReq):
     if not is_ready:
         raise HTTPException(status_code=503, detail="Backend not ready yet")
         
-    input_text = req.query.strip()
-    if not input_text:
+    input_text = req.query.strip() if req.query else ""
+    selected_yt_id = req.selected_yt_id.strip() if req.selected_yt_id else ""
+    playlist_queries = [q.strip() for q in (req.playlist_queries or []) if q and q.strip()]
+
+    if not input_text and not selected_yt_id and not playlist_queries:
         raise HTTPException(status_code=400, detail="Empty query")
+    
+    group = req.group.strip()
+    if not group:
+        group = "default"
         
     extracted_songs = []
     processed_count = 0
     
+    if group not in audio_embeddings:
+        audio_embeddings[group] = {}
+    if group not in song_metadata:
+        song_metadata[group] = {}
+    
+    update_extract_state(is_extracting=True, status="Starting...", current=0, total=1)
+    
     # Check if Spotify URL
     if "open.spotify.com" in input_text:
+        global spotdl_client
         try:
-            spotdl = Spotdl(client_id="ae09839d37b945c2befde3297bee7dde", client_secret="5b6d92a5da9041d89cf3ac2fe188edc9")
-            songs = spotdl.search([input_text])
-            
-            temp_dir = tempfile.mkdtemp()
-            # Change directory temporarily so SpotDL downloads into the temp dir
-            original_dir = os.getcwd()
-            os.chdir(temp_dir)
-            
-            try:
-                results = spotdl.download_songs(songs)
-            finally:
-                os.chdir(original_dir)
+            update_extract_state(status="Downloading from Spotify. This may take a while...")
+            with spotify_lock:
+                if spotdl_client is None:
+                    download_options = {
+                        'format': 'mp3',
+                        'ffmpeg_args': "-ar 24000",
+                        'bitrate': '128k'
+                    }
+                    spotdl_client = Spotdl(
+                        client_id="ae09839d37b945c2befde3297bee7dde", 
+                        client_secret="5b6d92a5da9041d89cf3ac2fe188edc9", 
+                        downloader_settings=download_options
+                    )
+                songs = spotdl_client.search([input_text])
+                
+                temp_dir = tempfile.mkdtemp()
+                # Change directory temporarily so SpotDL downloads into the temp dir
+                original_dir = os.getcwd()
+                os.chdir(temp_dir)
+                
+                try:
+                    results = spotdl_client.download_songs(songs)
+                finally:
+                    os.chdir(original_dir)
             
             for result, _ in results:
                 if not result:
                     continue
                 # spot_dl leaves the downloaded file in the temp dir
                 pt_file = [f for f in os.listdir(temp_dir) if f.endswith('.mp3')]
-                for file_name in pt_file:
+                update_extract_state(total=len(pt_file), status="Extracting embeddings...")
+                for idx, file_name in enumerate(pt_file):
+                    update_extract_state(current=idx, status=f"Extracting {idx + 1}/{len(pt_file)}")
                     audio_path = os.path.join(temp_dir, file_name)
-                    # Use SpotDL's song object to get a suitable ID and meta
-                    yt_id = "spot_" + sum([ord(c) for c in file_name]) # simple hash
-                    yt_id = file_name.replace(".mp3", "").replace(" ", "_") # Better simple ID
-                    
+                    yt_id = file_name.replace(".mp3", "").replace(" ", "_")
                     display_name = file_name.replace(".mp3", "")
                     
-                    if yt_id in audio_embeddings or yt_id in temp_embeddings:
+                    if yt_id in audio_embeddings.get(group, {}):
                         if os.path.exists(audio_path):
                             os.remove(audio_path)
                         continue
                         
+                    cache_path = os.path.join(CACHE_DIR, f"{yt_id}.pt")
+                    meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
+                    
+                    if os.path.exists(cache_path) and os.path.exists(meta_path):
+                        try:
+                            with open(meta_path, 'r', encoding='utf-8') as f:
+                                metadata = json.load(f)
+                            
+                            if 'groups' not in metadata:
+                                metadata['groups'] = [metadata.get('group', 'default')]
+                                if 'group' in metadata:
+                                    del metadata['group']
+                            
+                            if group not in metadata['groups']:
+                                metadata['groups'].append(group)
+                                
+                            with open(meta_path, 'w', encoding='utf-8') as f:
+                                json.dump(metadata, f, ensure_ascii=False)
+                                
+                            display_name = f"{metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}"
+                            embed = torch.load(cache_path, map_location=device, weights_only=True)
+                            
+                            audio_embeddings[group][yt_id] = embed
+                            song_metadata[group][yt_id] = display_name
+                            extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
+                            processed_count += 1
+                            
+                            if os.path.exists(audio_path):
+                                os.remove(audio_path)
+                            continue
+                        except Exception as e:
+                            print(f"Failed to load existing cache for {yt_id}, re-extracting: {e}")
+                    
                     wav_tensor, sr = torchaudio.load(audio_path)
                     if wav_tensor.shape[0] > 1:
                         wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
@@ -300,10 +723,14 @@ def extract_embedding(req: UploadReq):
                         
                     embed = embed[0].unsqueeze(0).cpu()
                     
-                    temp_embeddings[yt_id] = embed
-                    temp_song_names[yt_id] = display_name
+                    audio_embeddings[group][yt_id] = embed
+                    song_metadata[group][yt_id] = display_name
                     extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
                     
+                    torch.save(embed, cache_path)
+                    with open(meta_path, 'w', encoding='utf-8') as f:
+                        json.dump({"title": display_name.split(' - ')[-1] if ' - ' in display_name else display_name, "artist": display_name.split(' - ')[0] if ' - ' in display_name else 'Unknown', "groups": [group]}, f, ensure_ascii=False)
+                        
                     if os.path.exists(audio_path):
                         os.remove(audio_path)
                         
@@ -316,51 +743,111 @@ def extract_embedding(req: UploadReq):
             except:
                 pass
                 
+            update_extract_state(is_extracting=False, status="Done", current=processed_count, total=processed_count)
             return {"processed": processed_count, "extracted": extracted_songs}
                 
         except Exception as e:
+            update_extract_state(is_extracting=False, status=f"Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # --- YouTube Logic ---
-    search_url = input_text
-    if 'list=' in input_text:
-        pass
-    elif 'v=' in input_text:
-        yt_id = input_text.split('v=')[1].split('&')[0]
-        search_url = f'https://www.youtube.com/watch?v={yt_id}'
-    elif 'youtu.be/' in input_text:
-        yt_id = input_text.split('youtu.be/')[1].split('?')[0]
-        search_url = f'https://www.youtube.com/watch?v={yt_id}'
-    else:
-        search_url = f'https://www.youtube.com/watch?v={input_text}'
-
     yt_ids = []
-    ydl_opts_extract = {
-        'extract_flat': True, 
-        'quiet': True,
-        'ignoreerrors': True,
-        'sleep_interval': 10,
-        'max_sleep_interval': 30,
-        'sleep_requests': 1
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_extract) as ydl:
-            info = ydl.extract_info(search_url, download=False)
-            if info and 'entries' in info:
-                yt_ids = [entry['id'] for entry in info['entries'] if entry]
-            elif info:
-                yt_ids = [info['id']]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract IDs: {str(e)}")
+    if selected_yt_id:
+        yt_ids = [selected_yt_id]
+        update_extract_state(status="Selected song confirmed. Starting extraction...", current=0, total=1)
+    elif playlist_queries:
+        update_extract_state(status="Resolving and processing playlist songs...", current=0, total=len(playlist_queries))
+    else:
+        # --- YouTube URL/ID or search query logic ---
+        ydl_opts_extract = {
+            'extract_flat': True,
+            'quiet': True,
+            'ignoreerrors': True,
+            'retries': 2,
+            'sleep_interval': 10,
+            'max_sleep_interval': 20,
+            'sleep_requests': 1,
+            'cookiefile': 'cookies.txt'
+        }
+
+        if not is_youtube_reference(input_text):
+            try:
+                update_extract_state(status="Searching YouTube Music songs...")
+                resolved = resolve_query_to_yt_id(input_text, candidate_limit=5)
+                if not resolved:
+                    update_extract_state(is_extracting=False, status="No song match found for query")
+                    raise HTTPException(status_code=404, detail="No song match found for query")
+                yt_ids = [resolved]
+                update_extract_state(status="Best match selected. Starting extraction...", current=0, total=1)
+            except HTTPException:
+                raise
+            except Exception as e:
+                update_extract_state(is_extracting=False, status="Failed to search YouTube Music")
+                raise HTTPException(status_code=500, detail=f"Failed to search YouTube Music: {str(e)}")
+        else:
+            if 'list=' in input_text:
+                search_url = input_text
+                try:
+                    update_extract_state(status="Fetching YouTube metadata...")
+                    info = yt_dlp_extract_info(search_url, ydl_opts_extract, download=False)
+                    if info and 'entries' in info:
+                        yt_ids = [entry['id'] for entry in info['entries'] if entry]
+                    elif info:
+                        yt_ids = [info['id']]
+                    update_extract_state(total=len(yt_ids), current=0, status=f"Found {len(yt_ids)} videos, starting download...")
+                except Exception as e:
+                    update_extract_state(is_extracting=False, status="Failed to extract IDs")
+                    raise HTTPException(status_code=500, detail=f"Failed to extract IDs: {str(e)}")
+            else:
+                if 'v=' in input_text:
+                    yt_id = input_text.split('v=')[1].split('&')[0]
+                elif 'youtu.be/' in input_text:
+                    yt_id = input_text.split('youtu.be/')[1].split('?')[0]
+                else:
+                    yt_id = input_text.strip()
+                yt_ids = [yt_id]
+                update_extract_state(total=len(yt_ids), current=0, status=f"Starting download...")
 
     def process_yt_id(yt_id):
-        if yt_id in audio_embeddings or yt_id in temp_embeddings:
-            return None
+        if yt_id in audio_embeddings.get(group, {}):
+            return {
+                "yt_id": yt_id,
+                "display_name": song_metadata.get(group, {}).get(yt_id, yt_id),
+                "embed": audio_embeddings[group][yt_id]
+            }
+
+        cache_path = os.path.join(CACHE_DIR, f"{yt_id}.pt")
+        meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
+        
+        if os.path.exists(cache_path) and os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                
+                if 'groups' not in metadata:
+                    metadata['groups'] = [metadata.get('group', 'default')]
+                    if 'group' in metadata:
+                        del metadata['group']
+                
+                if group not in metadata['groups']:
+                    metadata['groups'].append(group)
+                    
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False)
+                    
+                display_name = f"{metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}"
+                embed = torch.load(cache_path, map_location=device, weights_only=True)
+                
+                return {
+                    "yt_id": yt_id,
+                    "display_name": display_name,
+                    "embed": embed
+                }
+            except Exception as e:
+                print(f"Failed to load existing cache for {yt_id}, re-extracting: {e}")
             
         temp_dir = tempfile.mkdtemp()
         audio_path = os.path.join(temp_dir, f"{yt_id}.mp3")
-        ydl_opts = {
-            'format': 'bestaudio/best',
+        base_ydl_opts = {
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -372,26 +859,51 @@ def extract_embedding(req: UploadReq):
             'postprocessor_args': [
                 '-ar', '24000', '-ac', '1'
             ],
-            'sleep_interval': 10,
-            'max_sleep_interval': 30,
-            'sleep_requests': 1,
+            'noplaylist': True,
             'ratelimit': 5000000,
             'ignoreerrors': True,
+            'retries': 2,
+            'fragment_retries': 2,
+            'sleep_interval': 10,
+            'max_sleep_interval': 20,
+            'sleep_requests': 1,
+
+            'cookiefile': 'cookies.txt',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web', 'ios', 'tv']
+                }
+            }
         }
-        
+
         extracted_info = None
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f'https://www.youtube.com/watch?v={yt_id}', download=True)
-                
-                if info:
-                    metadata = {
-                        'title': info.get('title', 'Unknown Title'),
-                        'artist': info.get('uploader', 'Unknown Artist')
-                    }
-                    meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
-                    with open(meta_path, 'w', encoding='utf-8') as f:
-                        json.dump(metadata, f, ensure_ascii=False)
+            metadata = {
+                'title': 'Unknown Title',
+                'artist': 'Unknown Artist',
+                'groups': [group]
+            }
+            
+            ydl_opts = {
+                **base_ydl_opts,
+                'format': 'bestaudio[ext=m4a]/bestaudio/best/ba/b/all',
+            }
+            
+            info = None
+            try:
+                info = yt_dlp_extract_info(f'https://www.youtube.com/watch?v={yt_id}', ydl_opts, download=True)
+            except Exception as e:
+                print(f"Audio download failed for {yt_id}: {e}")
+
+            if not os.path.exists(audio_path):
+                return None
+
+            if info:
+                metadata['title'] = info.get('title', 'Unknown Title')
+                metadata['artist'] = info.get('uploader', 'Unknown Artist')
+                meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False)
             
             if not os.path.exists(audio_path):
                 return None
@@ -414,6 +926,8 @@ def extract_embedding(req: UploadReq):
                 
             embed = embed[0].unsqueeze(0).cpu()
             
+            torch.save(embed, os.path.join(CACHE_DIR, f"{yt_id}.pt"))
+            
             extracted_info = {
                 "yt_id": yt_id,
                 "display_name": display_name,
@@ -435,18 +949,135 @@ def extract_embedding(req: UploadReq):
                 
         return extracted_info
 
+    if playlist_queries and not selected_yt_id:
+        seen_ids = set()
+        total_queries = len(playlist_queries)
+
+        for idx, query in enumerate(playlist_queries, start=1):
+            update_extract_state(
+                status=f"Resolving {idx}/{total_queries}: {query[:50]}",
+                current=idx - 1,
+                total=total_queries,
+            )
+            try:
+                if is_youtube_reference(query):
+                    if 'v=' in query:
+                        resolved_yt_id = query.split('v=')[1].split('&')[0]
+                    elif 'youtu.be/' in query:
+                        resolved_yt_id = query.split('youtu.be/')[1].split('?')[0]
+                    elif bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", query.strip())):
+                        resolved_yt_id = query.strip()
+                    else:
+                        resolved_yt_id = resolve_query_to_yt_id(query, candidate_limit=3)
+                else:
+                    resolved_yt_id = resolve_query_to_yt_id(query, candidate_limit=3)
+            except Exception as e:
+                print(f"Failed to resolve playlist line '{query}': {e}")
+                update_extract_state(current=idx, status=f"Skipped {idx}/{total_queries} (resolve failed)")
+                continue
+
+            if not resolved_yt_id:
+                update_extract_state(current=idx, status=f"Skipped {idx}/{total_queries} (no match)")
+                continue
+
+            if resolved_yt_id in seen_ids:
+                update_extract_state(current=idx, status=f"Skipped {idx}/{total_queries} (duplicate)")
+                continue
+            seen_ids.add(resolved_yt_id)
+
+            update_extract_state(
+                status=f"Downloading/extracting {idx}/{total_queries}",
+                current=idx - 1,
+                total=total_queries,
+            )
+
+            try:
+                res = process_yt_id(resolved_yt_id)
+                if res:
+                    audio_embeddings[group][res["yt_id"]] = res["embed"]
+                    song_metadata[group][res["yt_id"]] = res["display_name"]
+                    extracted_songs.append({"yt_id": res["yt_id"], "display_name": res["display_name"]})
+                    processed_count += 1
+            except Exception as e:
+                print(f"File processing failed for playlist item '{query}': {e}")
+
+            update_extract_state(current=idx, status=f"Processed {idx}/{total_queries}")
+            if idx < total_queries and PLAYLIST_ITEM_DELAY_MS > 0:
+                time.sleep(PLAYLIST_ITEM_DELAY_MS / 1000.0)
+
+        if processed_count == 0:
+            update_extract_state(is_extracting=False, status="No songs matched from playlist queries")
+            raise HTTPException(status_code=400, detail="No songs matched from playlist queries")
+
+        update_extract_state(is_extracting=False, status=f"Done. Added {processed_count} songs.")
+        return {"processed": processed_count, "extracted": extracted_songs}
+
     max_workers = 4 
+    completed_so_far = 0
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_yt_id, yid) for yid in yt_ids]
         for future in as_completed(futures):
+            completed_so_far += 1
+            update_extract_state(current=completed_so_far, status=f"Processed {completed_so_far} / {len(yt_ids)}")
             try:
                 res = future.result()
                 if res:
-                    temp_embeddings[res["yt_id"]] = res["embed"]
-                    temp_song_names[res["yt_id"]] = res["display_name"]
+                    audio_embeddings[group][res["yt_id"]] = res["embed"]
+                    song_metadata[group][res["yt_id"]] = res["display_name"]
                     extracted_songs.append({"yt_id": res["yt_id"], "display_name": res["display_name"]})
                     processed_count += 1
             except Exception as e:
                 print(f"File processing failed: {e}")
 
+    update_extract_state(is_extracting=False, status=f"Done. Added {processed_count} songs.")
     return {"processed": processed_count, "extracted": extracted_songs}
+
+class RemoveSongsReq(BaseModel):
+    yt_ids: List[str]
+    group: str = "default"
+
+@app.post("/remove_songs")
+def remove_songs(req: RemoveSongsReq):
+    if not is_ready:
+        raise HTTPException(status_code=503, detail="Backend not ready yet")
+        
+    group = req.group.strip() if req.group else "default"
+    removed_count = 0
+
+    if group in audio_embeddings:
+        for yt_id in req.yt_ids:
+            if yt_id in audio_embeddings[group]:
+                del audio_embeddings[group][yt_id]
+                removed_count += 1
+            if group in song_metadata and yt_id in song_metadata[group]:
+                del song_metadata[group][yt_id]
+                
+            # Handle cache removal or update
+            pt_path = os.path.join(CACHE_DIR, f"{yt_id}.pt")
+            json_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                    
+                    if 'groups' in metadata and group in metadata['groups']:
+                        metadata['groups'].remove(group)
+                    
+                    if not metadata.get('groups'):
+                        if os.path.exists(pt_path):
+                            os.remove(pt_path)
+                        os.remove(json_path)
+                    else:
+                        with open(json_path, 'w', encoding='utf-8') as f:
+                            json.dump(metadata, f, ensure_ascii=False)
+                except Exception as e:
+                    print(f"Failed to update cache for {yt_id}: {e}")
+                
+        if len(audio_embeddings[group]) == 0:
+            del audio_embeddings[group]
+            if group in song_metadata:
+                del song_metadata[group]
+                
+    return {"removed": removed_count}
+
