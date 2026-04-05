@@ -632,120 +632,27 @@ def extract_embedding(req: UploadReq):
     if "open.spotify.com" in input_text:
         global spotdl_client
         try:
-            update_extract_state(status="Downloading from Spotify. This may take a while...")
+            update_extract_state(status="Fetching Spotify playlist data...")
             with spotify_lock:
                 if spotdl_client is None:
-                    download_options = {
-                        'format': 'mp3',
-                        'ffmpeg_args': "-ar 24000",
-                        'bitrate': '128k'
-                    }
                     spotdl_client = Spotdl(
                         client_id="ae09839d37b945c2befde3297bee7dde", 
-                        client_secret="5b6d92a5da9041d89cf3ac2fe188edc9", 
-                        downloader_settings=download_options
+                        client_secret="5b6d92a5da9041d89cf3ac2fe188edc9"
                     )
                 songs = spotdl_client.search([input_text])
                 
-                temp_dir = tempfile.mkdtemp()
-                # Change directory temporarily so SpotDL downloads into the temp dir
-                original_dir = os.getcwd()
-                os.chdir(temp_dir)
+                spotify_queries = [f"{song.name} {song.artist}" for song in songs if song]
+                if not spotify_queries:
+                    update_extract_state(is_extracting=False, status="No songs matched from Spotify")
+                    raise HTTPException(status_code=400, detail="No songs matched from Spotify URL")
                 
-                try:
-                    results = spotdl_client.download_songs(songs)
-                finally:
-                    os.chdir(original_dir)
-            
-            for result, _ in results:
-                if not result:
-                    continue
-                # spot_dl leaves the downloaded file in the temp dir
-                pt_file = [f for f in os.listdir(temp_dir) if f.endswith('.mp3')]
-                update_extract_state(total=len(pt_file), status="Extracting embeddings...")
-                for idx, file_name in enumerate(pt_file):
-                    update_extract_state(current=idx, status=f"Extracting {idx + 1}/{len(pt_file)}")
-                    audio_path = os.path.join(temp_dir, file_name)
-                    yt_id = file_name.replace(".mp3", "").replace(" ", "_")
-                    display_name = file_name.replace(".mp3", "")
-                    
-                    if yt_id in audio_embeddings.get(group, {}):
-                        if os.path.exists(audio_path):
-                            os.remove(audio_path)
-                        continue
-                        
-                    cache_path = os.path.join(CACHE_DIR, f"{yt_id}.pt")
-                    meta_path = os.path.join(CACHE_DIR, f"{yt_id}.json")
-                    
-                    if os.path.exists(cache_path) and os.path.exists(meta_path):
-                        try:
-                            with open(meta_path, 'r', encoding='utf-8') as f:
-                                metadata = json.load(f)
-                            
-                            if 'groups' not in metadata:
-                                metadata['groups'] = [metadata.get('group', 'default')]
-                                if 'group' in metadata:
-                                    del metadata['group']
-                            
-                            if group not in metadata['groups']:
-                                metadata['groups'].append(group)
-                                
-                            with open(meta_path, 'w', encoding='utf-8') as f:
-                                json.dump(metadata, f, ensure_ascii=False)
-                                
-                            display_name = f"{metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}"
-                            embed = torch.load(cache_path, map_location=device, weights_only=True)
-                            
-                            audio_embeddings[group][yt_id] = embed
-                            song_metadata[group][yt_id] = display_name
-                            extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
-                            processed_count += 1
-                            
-                            if os.path.exists(audio_path):
-                                os.remove(audio_path)
-                            continue
-                        except Exception as e:
-                            print(f"Failed to load existing cache for {yt_id}, re-extracting: {e}")
-                    
-                    wav_tensor, sr = torchaudio.load(audio_path)
-                    if wav_tensor.shape[0] > 1:
-                        wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
-                        
-                    max_val = torch.max(torch.abs(wav_tensor))
-                    if max_val > 0:
-                        wav_tensor = wav_tensor / max_val
-                        
-                    wav_tensor = wav_tensor.to(device)
-                    
-                    with torch.no_grad():
-                        with model_lock:
-                            embed = mulan(wavs=wav_tensor)
-                        
-                    embed = embed[0].unsqueeze(0).cpu()
-                    
-                    audio_embeddings[group][yt_id] = embed
-                    song_metadata[group][yt_id] = display_name
-                    extracted_songs.append({"yt_id": yt_id, "display_name": display_name})
-                    
-                    torch.save(embed, cache_path)
-                    with open(meta_path, 'w', encoding='utf-8') as f:
-                        json.dump({"title": display_name.split(' - ')[-1] if ' - ' in display_name else display_name, "artist": display_name.split(' - ')[0] if ' - ' in display_name else 'Unknown', "groups": [group]}, f, ensure_ascii=False)
-                        
-                    if os.path.exists(audio_path):
-                        os.remove(audio_path)
-                        
-                    processed_count += 1
-            
-            try:
-                for f in os.listdir(temp_dir):
-                    os.remove(os.path.join(temp_dir, f))
-                os.rmdir(temp_dir)
-            except:
-                pass
+                playlist_queries.extend(spotify_queries)
                 
-            update_extract_state(is_extracting=False, status="Done", current=processed_count, total=processed_count)
-            return {"processed": processed_count, "extracted": extracted_songs}
+            input_text = ""
+            update_extract_state(status=f"Found {len(spotify_queries)} songs from Spotify. Resolving...", current=0, total=len(playlist_queries))
                 
+        except HTTPException:
+            raise
         except Exception as e:
             update_extract_state(is_extracting=False, status=f"Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
