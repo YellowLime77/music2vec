@@ -1,6 +1,11 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import os
+import traceback
+from dotenv import load_dotenv
+
+load_dotenv()
 import json
 import re
 from urllib.parse import quote_plus
@@ -11,12 +16,24 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from spotdl import Spotdl
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
 from muq import MuQMuLan
 from typing import List, Dict, Optional, Any
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Music2Vec Backend")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"Unhandled Error on {request.method} {request.url}: {exc}")
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    print(f"HTTP Exception {exc.status_code} on {request.method} {request.url}: {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,7 +123,7 @@ def yt_dlp_extract_info(url: str, base_opts: Dict[str, Any], download: bool):
 
 # Global state
 mulan = None
-spotdl_client = None
+spotify_client = None
 spotify_lock = threading.Lock()
 audio_embeddings = {}  # {group_name: {yt_id: embed}}
 song_metadata = {}  # {group_name: {yt_id: display_name}}
@@ -355,6 +372,172 @@ def search_song(req: SearchSongReq):
 class SearchTextReq(BaseModel):
     text: str
     groups: List[str] = Field(default_factory=list)
+
+class EmbeddingVisualizationReq(BaseModel):
+    groups: List[str] = Field(default_factory=list)
+
+class EmbeddingTextVisualizationReq(BaseModel):
+    text: str
+    groups: List[str] = Field(default_factory=list)
+
+MAX_VIZ_POINTS_PER_GROUP = 5000
+
+def _collect_visualization_rows(groups: List[str]):
+    rows: List[torch.Tensor] = []
+    rows_meta: List[Dict[str, str]] = []
+
+    for group in groups:
+        group_embeddings = audio_embeddings.get(group, {})
+        group_items = list(group_embeddings.items())
+        if len(group_items) > MAX_VIZ_POINTS_PER_GROUP:
+            group_items = group_items[:MAX_VIZ_POINTS_PER_GROUP]
+
+        for yt_id, embed in group_items:
+            vector = embed.squeeze(0).detach().to("cpu", dtype=torch.float32)
+            if vector.ndim != 1:
+                continue
+            rows.append(vector)
+            rows_meta.append({
+                "yt_id": yt_id,
+                "group": group,
+                "display_name": song_metadata.get(group, {}).get(yt_id, yt_id),
+            })
+
+    return rows, rows_meta
+
+def _project_visualization_rows(groups: List[str]):
+    rows, rows_meta = _collect_visualization_rows(groups)
+    if not rows:
+        return [], None
+
+    # Guard against malformed rows with mismatched embedding dimensions.
+    target_dim = rows[0].shape[0]
+    valid_rows: List[torch.Tensor] = []
+    valid_meta: List[Dict[str, str]] = []
+    for i, row in enumerate(rows):
+        if row.shape[0] == target_dim:
+            valid_rows.append(row)
+            valid_meta.append(rows_meta[i])
+
+    if not valid_rows:
+        return [], None
+
+    matrix = torch.stack(valid_rows, dim=0)
+    center = matrix.mean(dim=0, keepdim=True)
+    components: Optional[torch.Tensor] = None
+    q = 0
+
+    if matrix.size(0) == 1:
+        coords = torch.zeros((1, 2), dtype=torch.float32)
+    else:
+        centered = matrix - center
+        q = min(2, centered.size(0), centered.size(1))
+        if q <= 0:
+            coords = torch.zeros((centered.size(0), 2), dtype=torch.float32)
+        else:
+            try:
+                _, _, v = torch.pca_lowrank(centered, q=q)
+                components = v[:, :q]
+                projected = centered @ components
+                if q == 1:
+                    zeros = torch.zeros((projected.size(0), 1), dtype=projected.dtype)
+                    coords = torch.cat([projected, zeros], dim=1)
+                else:
+                    coords = projected
+            except Exception:
+                coords = torch.zeros((centered.size(0), 2), dtype=torch.float32)
+
+    min_xy = coords.min(dim=0).values
+    max_xy = coords.max(dim=0).values
+    span = (max_xy - min_xy).clamp_min(1e-6)
+    norm = (coords - min_xy) / span
+    scaled = norm * 2 - 1
+
+    points = []
+    for i, meta in enumerate(valid_meta):
+        points.append({
+            "yt_id": meta["yt_id"],
+            "group": meta["group"],
+            "display_name": meta["display_name"],
+            "x": float(scaled[i, 0].item()),
+            "y": float(scaled[i, 1].item()),
+        })
+
+    projection_ctx = {
+        "target_dim": target_dim,
+        "center": center,
+        "components": components,
+        "q": q,
+        "min_xy": min_xy,
+        "span": span,
+    }
+    return points, projection_ctx
+
+@app.post("/visualization/embeddings")
+def get_embedding_visualization(req: EmbeddingVisualizationReq):
+    if not is_ready:
+        raise HTTPException(status_code=503, detail="Backend not ready yet")
+
+    groups = req.groups if req.groups else list(audio_embeddings.keys())
+    points, _ = _project_visualization_rows(groups)
+    return {"points": points}
+
+@app.post("/visualization/text")
+def get_text_embedding_visualization(req: EmbeddingTextVisualizationReq):
+    if not is_ready:
+        raise HTTPException(status_code=503, detail="Backend not ready yet")
+
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    groups = req.groups if req.groups else list(audio_embeddings.keys())
+    points, projection_ctx = _project_visualization_rows(groups)
+    if not projection_ctx:
+        return {"point": None, "nearest": []}
+
+    with torch.no_grad():
+        with model_lock:
+            text_embed = mulan(texts=[text]).to(device)
+
+    vector = text_embed.squeeze(0).detach().to("cpu", dtype=torch.float32)
+    if vector.ndim != 1:
+        raise HTTPException(status_code=500, detail="Text embedding shape is invalid")
+    if vector.shape[0] != projection_ctx["target_dim"]:
+        raise HTTPException(status_code=500, detail="Embedding dimension mismatch")
+
+    centered = vector.unsqueeze(0) - projection_ctx["center"]
+    components = projection_ctx["components"]
+    q = projection_ctx["q"]
+
+    if components is not None and q > 0:
+        projected = centered @ components
+        if q == 1:
+            zeros = torch.zeros((1, 1), dtype=projected.dtype)
+            coords = torch.cat([projected, zeros], dim=1)
+        else:
+            coords = projected
+    else:
+        coords = torch.zeros((1, 2), dtype=torch.float32)
+
+    norm = (coords - projection_ctx["min_xy"]) / projection_ctx["span"]
+    scaled = norm * 2 - 1
+    text_x = float(scaled[0, 0].item())
+    text_y = float(scaled[0, 1].item())
+
+    nearest = sorted(
+        points,
+        key=lambda p: (p["x"] - text_x) ** 2 + (p["y"] - text_y) ** 2
+    )[:10]
+
+    return {
+        "point": {
+            "text": text,
+            "x": text_x,
+            "y": text_y,
+        },
+        "nearest": nearest,
+    }
 
 @app.post("/search/text")
 def search_text(req: SearchTextReq):
@@ -630,18 +813,61 @@ def extract_embedding(req: UploadReq):
     
     # Check if Spotify URL
     if "open.spotify.com" in input_text:
-        global spotdl_client
+        global spotify_client
         try:
             update_extract_state(status="Fetching Spotify playlist data...")
             with spotify_lock:
-                if spotdl_client is None:
-                    spotdl_client = Spotdl(
-                        client_id=os.environ['SPOTIFY_CLIENT_ID'], 
-                        client_secret=os.environ['SPOTIFY_CLIENT_SECRET']
-                    )
-                songs = spotdl_client.search([input_text])
+                if spotify_client is None:
+                    # Using SPOTIPY_ values as they are set in .env
+                    client_id = os.getenv('SPOTIPY_CLIENT_ID')
+                    client_secret = os.getenv('SPOTIPY_CLIENT_SECRET')
+                    if not client_id or not client_secret:
+                        update_extract_state(is_extracting=False, status="Spotify credentials missing")
+                        raise HTTPException(status_code=500, detail="SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET environment variables must be set.")
+                        
+                    spotify_client = spotipy.Spotify(auth_manager=SpotifyOAuth(
+                        redirect_uri="http://127.0.0.1:9900",
+                        scope="playlist-read-private"
+                    ))
                 
-                spotify_queries = [f"{song.name} {song.artist}" for song in songs if song]
+                parts = input_text.split('/')
+                spotify_queries = []
+                if 'playlist' in parts:
+                    playlist_id = parts[parts.index('playlist') + 1].split('?')[0]
+                    results = spotify_client.playlist_items(playlist_id)
+                    tracks = results['items']
+                    while results['next']:
+                        results = spotify_client.next(results)
+                        tracks.extend(results['items'])
+                    
+                    for playlist_item in tracks:
+                        track = playlist_item.get('track') or playlist_item.get('item')
+                        if track:
+                            artist = track['artists'][0]['name'] if track.get('artists') else ""
+                            name = track.get('name', '')
+                            if name:
+                                spotify_queries.append(f"{name} {artist}".strip())
+                elif 'track' in parts:
+                    track_id = parts[parts.index('track') + 1].split('?')[0]
+                    track = spotify_client.track(track_id)
+                    artist = track['artists'][0]['name'] if track['artists'] else ""
+                    name = track['name']
+                    spotify_queries.append(f"{name} {artist}".strip())
+                elif 'album' in parts:
+                    album_id = parts[parts.index('album') + 1].split('?')[0]
+                    results = spotify_client.album_tracks(album_id)
+                    tracks = results['items']
+                    while results['next']:
+                        results = spotify_client.next(results)
+                        tracks.extend(results['items'])
+                    
+                    for track in tracks:
+                        artist = track['artists'][0]['name'] if track['artists'] else ""
+                        name = track['name']
+                        spotify_queries.append(f"{name} {artist}".strip())
+                else:
+                    raise ValueError("Unsupported Spotify URL format. Must be playlist, track, or album.")
+                
                 if not spotify_queries:
                     update_extract_state(is_extracting=False, status="No songs matched from Spotify")
                     raise HTTPException(status_code=400, detail="No songs matched from Spotify URL")
@@ -654,6 +880,8 @@ def extract_embedding(req: UploadReq):
         except HTTPException:
             raise
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             update_extract_state(is_extracting=False, status=f"Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -670,7 +898,7 @@ def extract_embedding(req: UploadReq):
             'quiet': True,
             'ignoreerrors': True,
             'retries': 2,
-            'sleep_interval': 10,
+            'sleep_interval': 5,
             'max_sleep_interval': 20,
             'sleep_requests': 1,
             'cookiefile': 'cookies.txt'
@@ -771,7 +999,7 @@ def extract_embedding(req: UploadReq):
             'ignoreerrors': True,
             'retries': 2,
             'fragment_retries': 2,
-            'sleep_interval': 10,
+            'sleep_interval': 5,
             'max_sleep_interval': 20,
             'sleep_requests': 1,
 

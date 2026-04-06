@@ -8,8 +8,9 @@ import { ResultsPanel } from "@/components/app/results-panel"
 import { FindSimilarTab } from "@/components/tabs/find-similar-tab"
 import { LibraryTab } from "@/components/tabs/library-tab"
 import { TextSearchTab } from "@/components/tabs/text-search-tab"
+import { VisualizationTab } from "@/components/tabs/visualization-tab"
 import { UploadTab } from "@/components/tabs/upload-tab"
-import { LibraryStructure, SearchResult, SongSearchPayload, TabId, UploadMode, YTMusicCandidate } from "@/types/music2vec"
+import { LibraryStructure, SearchResult, SongSearchPayload, TabId, UploadMode, VisualizationPoint, VisualizationTextPoint } from "@/types/music2vec"
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
 
@@ -31,15 +32,16 @@ export default function Home() {
   const [textSearch, setTextSearch] = useState("")
   const [selectedGroupsForTextSearch, setSelectedGroupsForTextSearch] = useState<string[]>([])
 
+  // Visualization Tab
+  const [vizPoints, setVizPoints] = useState<VisualizationPoint[]>([])
+  const [isVizLoading, setIsVizLoading] = useState(false)
+  const [vizTextPoint, setVizTextPoint] = useState<VisualizationTextPoint | null>(null)
+  const [isVizTextLoading, setIsVizTextLoading] = useState(false)
+
   // Upload Tab
-  const [uploadMode, setUploadMode] = useState<UploadMode>("youtube")
-  const [ytInput, setYtInput] = useState("")
-  const [singleSongQuery, setSingleSongQuery] = useState("")
-  const [singleSongCandidates, setSingleSongCandidates] = useState<YTMusicCandidate[]>([])
-  const [selectedCandidateId, setSelectedCandidateId] = useState("")
-  const [isSearchingUploadCandidates, setIsSearchingUploadCandidates] = useState(false)
-  const [playlistTextInput, setPlaylistTextInput] = useState("")
-  const [playlistFileName, setPlaylistFileName] = useState("")
+  const [uploadMode, setUploadMode] = useState<UploadMode>("url")
+  const [urlInput, setUrlInput] = useState("")
+  const [songQueriesInput, setSongQueriesInput] = useState("")
   const [isExtracting, setIsExtracting] = useState(false)
   const [extractProgress, setExtractProgress] = useState(0)
   const [selectedGroupForUpload, setSelectedGroupForUpload] = useState("")
@@ -76,6 +78,11 @@ export default function Home() {
     return () => clearInterval(extractInterval)
   }, [isExtracting])
 
+  useEffect(() => {
+    if (!isReady || activeTab !== "visualization") return
+    void fetchVisualizationPoints([])
+  }, [activeTab, isReady])
+
   const checkExtractStatus = async () => {
     try {
       const resp = await axios.get(`${API_BASE_URL}/extract_status`)
@@ -107,6 +114,38 @@ export default function Home() {
       setLibrary(resp.data.library || {})
     } catch (e: unknown) {
       if (e instanceof Error) setStatus(`Error fetching library: ${e.message}`)
+    }
+  }
+
+  const fetchVisualizationPoints = async (groups: string[]) => {
+    setIsVizLoading(true)
+    try {
+      const resp = await axios.post(`${API_BASE_URL}/visualization/embeddings`, { groups })
+      setVizPoints(resp.data?.points || [])
+    } catch (e: unknown) {
+      if (axios.isAxiosError(e)) {
+        setStatus(`Visualization failed: ${e.response?.data?.detail || e.message}`)
+      } else if (e instanceof Error) {
+        setStatus(`Visualization failed: ${e.message}`)
+      }
+    } finally {
+      setIsVizLoading(false)
+    }
+  }
+
+  const fetchVisualizationTextPoint = async (text: string, groups: string[]) => {
+    setIsVizTextLoading(true)
+    try {
+      const resp = await axios.post(`${API_BASE_URL}/visualization/text`, { text, groups })
+      setVizTextPoint(resp.data?.point || null)
+    } catch (e: unknown) {
+      if (axios.isAxiosError(e)) {
+        setStatus(`Text projection failed: ${e.response?.data?.detail || e.message}`)
+      } else if (e instanceof Error) {
+        setStatus(`Text projection failed: ${e.message}`)
+      }
+    } finally {
+      setIsVizTextLoading(false)
     }
   }
 
@@ -159,59 +198,6 @@ export default function Home() {
     }
   }
 
-  const handleSearchUploadCandidates = async () => {
-    if (!singleSongQuery.trim()) {
-      setStatus("Type a song + artist query first.")
-      return
-    }
-
-    setStatus("Searching YouTube Music songs...")
-    setIsSearchingUploadCandidates(true)
-    setSelectedCandidateId("")
-    try {
-      const res = await axios.post(`${API_BASE_URL}/ytmusic/search`, {
-        query: singleSongQuery.trim(),
-        limit: 8,
-      })
-      const results = (res.data?.results || []) as YTMusicCandidate[]
-      setSingleSongCandidates(results)
-      if (results.length > 0) {
-        setSelectedCandidateId(results[0].yt_id)
-        setStatus(`Found ${results.length} candidate songs. Select one and upload.`)
-      } else {
-        setStatus("No songs found. Try a more specific query.")
-      }
-    } catch (e: unknown) {
-      if (axios.isAxiosError(e)) {
-        setStatus(`Search failed: ${e.response?.data?.detail || e.message}`)
-      } else if (e instanceof Error) {
-        setStatus(`Search failed: ${e.message}`)
-      }
-    } finally {
-      setIsSearchingUploadCandidates(false)
-    }
-  }
-
-  const handlePlaylistFile = async (file: File | null) => {
-    if (!file) return
-
-    if (!file.name.toLowerCase().endsWith(".txt")) {
-      setStatus("Please upload a .txt file for playlist queries.")
-      return
-    }
-
-    try {
-      const text = await file.text()
-      setPlaylistTextInput(text)
-      setPlaylistFileName(file.name)
-      setStatus(`Loaded playlist from ${file.name}.`)
-    } catch (e: unknown) {
-      if (e instanceof Error) {
-        setStatus(`Failed to read file: ${e.message}`)
-      }
-    }
-  }
-
   const handleExtract = async () => {
     const group = newGroupName.trim() || selectedGroupForUpload || "default"
     if (!group) {
@@ -219,56 +205,59 @@ export default function Home() {
       return
     }
 
-    const payload: {
-      group: string
-      query?: string
-      selected_yt_id?: string
-      playlist_queries?: string[]
-    } = { group }
-
-    if (uploadMode === "youtube") {
-      if (!ytInput.trim()) {
-        setStatus("Paste a YouTube URL or video ID first.")
-        return
-      }
-      payload.query = ytInput.trim()
-    }
-
-    if (uploadMode === "singleQuery") {
-      if (!selectedCandidateId) {
-        setStatus("Search and select a song first.")
-        return
-      }
-      payload.selected_yt_id = selectedCandidateId
-      payload.query = singleSongQuery.trim()
-    }
-
-    if (uploadMode === "playlistQueries") {
-      const lines = playlistTextInput
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-
-      if (lines.length === 0) {
-        setStatus("Enter playlist lines or upload a .txt file first.")
-        return
-      }
-
-      payload.playlist_queries = lines
-      payload.query = "playlist-queries"
-    }
-
     setIsExtracting(true)
+    setExtractProgress(0)
     setStatus("Extracting embeddings...")
     try {
-      const res = await axios.post(`${API_BASE_URL}/extract`, payload, { timeout: 300000 })
-      setStatus(`Added ${res.data.processed} song(s) to ${group}.`)
-      setYtInput("")
-      setSingleSongQuery("")
-      setSingleSongCandidates([])
-      setSelectedCandidateId("")
-      setPlaylistTextInput("")
-      setPlaylistFileName("")
+      let totalProcessed = 0
+
+      if (uploadMode === "url") {
+        const lines = urlInput
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+
+        if (lines.length === 0) {
+          setStatus("Paste at least one YouTube or Spotify URL first.")
+          return
+        }
+
+        for (let i = 0; i < lines.length; i += 1) {
+          const line = lines[i]
+          setStatus(`Processing URL ${i + 1}/${lines.length}...`)
+          const res = await axios.post(
+            `${API_BASE_URL}/extract`,
+            { group, query: line },
+            { timeout: 300000 }
+          )
+          totalProcessed += Number(res.data?.processed || 0)
+          setExtractProgress(Math.round(((i + 1) / lines.length) * 100))
+        }
+      }
+
+      if (uploadMode === "songQueries") {
+        const lines = songQueriesInput
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+
+        if (lines.length === 0) {
+          setStatus("Enter at least one song name query first.")
+          return
+        }
+
+        const payload = lines.length === 1
+          ? { group, query: lines[0] }
+          : { group, playlist_queries: lines, query: "song-query-list" }
+
+        const res = await axios.post(`${API_BASE_URL}/extract`, payload, { timeout: 300000 })
+        totalProcessed += Number(res.data?.processed || 0)
+        setExtractProgress(100)
+      }
+
+      setStatus(`Added ${totalProcessed} song(s) to ${group}.`)
+      setUrlInput("")
+      setSongQueriesInput("")
       setNewGroupName("")
       fetchLibrary()
     } catch (e: unknown) {
@@ -278,6 +267,7 @@ export default function Home() {
         setStatus(`Upload failed: ${e.message}`)
       }
     } finally {
+      setExtractProgress(0)
       setIsExtracting(false)
     }
   }
@@ -383,19 +373,10 @@ export default function Home() {
           <UploadTab
             uploadMode={uploadMode}
             setUploadMode={setUploadMode}
-            ytInput={ytInput}
-            setYtInput={setYtInput}
-            singleSongQuery={singleSongQuery}
-            setSingleSongQuery={setSingleSongQuery}
-            singleSongCandidates={singleSongCandidates}
-            selectedCandidateId={selectedCandidateId}
-            setSelectedCandidateId={setSelectedCandidateId}
-            onSearchUploadCandidates={handleSearchUploadCandidates}
-            isSearchingUploadCandidates={isSearchingUploadCandidates}
-            playlistTextInput={playlistTextInput}
-            setPlaylistTextInput={setPlaylistTextInput}
-            playlistFileName={playlistFileName}
-            onPlaylistFileSelected={handlePlaylistFile}
+            urlInput={urlInput}
+            setUrlInput={setUrlInput}
+            songQueriesInput={songQueriesInput}
+            setSongQueriesInput={setSongQueriesInput}
             selectedGroupForUpload={selectedGroupForUpload}
             setSelectedGroupForUpload={setSelectedGroupForUpload}
             newGroupName={newGroupName}
@@ -406,6 +387,21 @@ export default function Home() {
             status={status}
             isReady={isReady}
             onExtract={handleExtract}
+          />
+        )
+
+      case "visualization":
+        return (
+          <VisualizationTab
+            allGroups={allGroups}
+            points={vizPoints}
+            textPoint={vizTextPoint}
+            isLoading={isVizLoading}
+            isTextLoading={isVizTextLoading}
+            onRefresh={fetchVisualizationPoints}
+            onSearchTextEmbedding={fetchVisualizationTextPoint}
+            onClearTextEmbedding={() => setVizTextPoint(null)}
+            onSetActiveVideo={setActiveVideoId}
           />
         )
     }

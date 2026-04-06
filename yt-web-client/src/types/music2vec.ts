@@ -1,4 +1,4 @@
-export type TabId = "library" | "song" | "text" | "upload"
+export type TabId = "library" | "song" | "text" | "visualization" | "upload"
 
 export type LibraryStructure = Record<string, Record<string, string>>
 
@@ -16,7 +16,21 @@ export type SongSearchPayload = {
   algo: string
 }
 
-export type UploadMode = "youtube" | "singleQuery" | "playlistQueries"
+export type UploadMode = "url" | "songQueries"
+
+export type VisualizationPoint = {
+  yt_id: string
+  group: string
+  display_name: string
+  x: number
+  y: number
+}
+
+export type VisualizationTextPoint = {
+  text: string
+  x: number
+  y: number
+}
 
 export type YTMusicCandidate = {
   yt_id: string
