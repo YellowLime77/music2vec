@@ -5,3 +5,4 @@ __pycache__
 archive.txt
 *cookies.txt
 .env
+.cache
