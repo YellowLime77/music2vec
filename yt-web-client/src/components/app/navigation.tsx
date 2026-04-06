@@ -1,5 +1,5 @@
 import React from "react"
-import { Library, MicVocal, Music, Plus } from "lucide-react"
+import { Library, MicVocal, Music, Plus, ScatterChart } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { TabId } from "@/types/music2vec"
 
@@ -20,6 +20,7 @@ const navItems: NavItem[] = [
   { id: "library", label: "My Library", mobileLabel: "Library", icon: Library },
   { id: "song", label: "Find Similar", mobileLabel: "Similar", icon: Music },
   { id: "text", label: "Text Search", mobileLabel: "Text", icon: MicVocal },
+  { id: "visualization", label: "Embedding Map", mobileLabel: "Map", icon: ScatterChart },
   { id: "upload", label: "Upload Music", mobileLabel: "Upload", icon: Plus },
 ]
 
