@@ -1,10 +1,11 @@
-import React, { useMemo, useRef, useState } from "react"
+import React, { useDeferredValue, useMemo, useRef, useState } from "react"
 import { Loader2, RefreshCcw, Search, ZoomIn, ZoomOut } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { VisualizationPoint, VisualizationTextPoint } from "@/types/music2vec"
 import { cn } from "@/lib/utils"
+import { useVirtualizer } from "@tanstack/react-virtual"
 
 type VisualizationTabProps = {
   allGroups: string[]
@@ -43,6 +44,59 @@ const pointKey = (p: VisualizationPoint) => `${p.group}::${p.yt_id}`
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 
+const VirtualizedSearchMatches = ({
+  searchMatches,
+  resolvedFocusedKey,
+  onFocus,
+}: {
+  searchMatches: VisualizationPoint[]
+  resolvedFocusedKey: string | null
+  onFocus: (key: string) => void
+}) => {
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const virtualizer = useVirtualizer({
+    count: searchMatches.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 34,
+    overscan: 10,
+  })
+
+  return (
+    <div ref={parentRef} className="h-44 overflow-y-auto pr-1 border rounded-md bg-slate-50/50 dark:bg-slate-900/30">
+      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => {
+          const p = searchMatches[virtualRow.index]
+          const key = pointKey(p)
+          const isActive = resolvedFocusedKey === key
+
+          return (
+            <div
+              key={`${key}-${virtualRow.index}`}
+              className="absolute left-0 top-0 w-full px-2 py-1"
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+              <button
+                type="button"
+                onClick={() => onFocus(key)}
+                className={cn(
+                  "w-full text-left text-xs px-2.5 py-1 rounded-md border transition-colors truncate",
+                  isActive
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-900"
+                )}
+                title={p.display_name}
+              >
+                {p.display_name}
+              </button>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 export function VisualizationTab({
   allGroups,
   points,
@@ -63,6 +117,7 @@ export function VisualizationTab({
   const [hasDragged, setHasDragged] = useState(false)
 
   const svgRef = useRef<SVGSVGElement | null>(null)
+  const deferredQuery = useDeferredValue(query)
 
   const sanitizedSelectedGroups = useMemo(() => {
     return selectedGroups.filter((g) => allGroups.includes(g))
@@ -81,7 +136,7 @@ export function VisualizationTab({
     return points.filter((p) => sanitizedSelectedGroups.includes(p.group))
   }, [points, sanitizedSelectedGroups])
 
-  const normalizedQuery = query.trim().toLowerCase()
+  const normalizedQuery = deferredQuery.trim().toLowerCase()
 
   const searchMatches = useMemo(() => {
     if (!normalizedQuery) return []
@@ -90,6 +145,10 @@ export function VisualizationTab({
       return haystack.includes(normalizedQuery)
     })
   }, [filteredPoints, normalizedQuery])
+
+  const searchMatchKeys = useMemo(() => {
+    return new Set(searchMatches.map((p) => pointKey(p)))
+  }, [searchMatches])
 
   const resolvedFocusedKey = useMemo(() => {
     if (!normalizedQuery || searchMatches.length === 0) {
@@ -293,27 +352,11 @@ export function VisualizationTab({
               </p>
             )}
             {searchMatches.length > 0 && (
-              <div className="flex flex-wrap gap-2 max-h-24 overflow-auto pr-1">
-                {searchMatches.slice(0, 24).map((p) => {
-                  const key = pointKey(p)
-                  const isActive = resolvedFocusedKey === key
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => setFocusedPointKey(key)}
-                      className={cn(
-                        "text-xs px-2.5 py-1 rounded-md border transition-colors",
-                        isActive
-                          ? "border-primary bg-primary/10 text-primary"
-                          : "border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-900"
-                      )}
-                    >
-                      {p.display_name}
-                    </button>
-                  )
-                })}
-              </div>
+              <VirtualizedSearchMatches
+                searchMatches={searchMatches}
+                resolvedFocusedKey={resolvedFocusedKey}
+                onFocus={setFocusedPointKey}
+              />
             )}
           </div>
 
@@ -420,7 +463,7 @@ export function VisualizationTab({
                   {filteredPoints.map((p) => {
                     const key = pointKey(p)
                     const isFocused = resolvedFocusedKey === key
-                    const isMatch = normalizedQuery.length > 0 && searchMatches.some((m) => pointKey(m) === key)
+                    const isMatch = normalizedQuery.length > 0 && searchMatchKeys.has(key)
                     const x = projectX(p.x)
                     const y = projectY(p.y)
                     const fill = groupColors[p.group] || "#64748b"

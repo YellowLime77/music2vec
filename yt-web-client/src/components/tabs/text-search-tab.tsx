@@ -1,8 +1,60 @@
-import React from "react"
+import React, { useRef } from "react"
 import { Search } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { useVirtualizer } from "@tanstack/react-virtual"
+import { cn } from "@/lib/utils"
+
+const VirtualizedTextSearchGroupList = ({
+  allGroups,
+  selectedGroupsForTextSearch,
+  onToggleGroup,
+}: {
+  allGroups: string[]
+  selectedGroupsForTextSearch: string[]
+  onToggleGroup: (group: string) => void
+}) => {
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const virtualizer = useVirtualizer({
+    count: allGroups.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 34,
+    overscan: 12,
+  })
+
+  return (
+    <div ref={parentRef} className="h-48 overflow-y-auto pr-1 border rounded-md bg-slate-50/40 dark:bg-slate-900/30">
+      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => {
+          const group = allGroups[virtualRow.index]
+          const isSelected = selectedGroupsForTextSearch.includes(group)
+          return (
+            <div
+              key={`${group}-${virtualRow.index}`}
+              className="absolute left-0 top-0 w-full px-2 py-1"
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+              <button
+                onClick={() => onToggleGroup(group)}
+                className={cn(
+                  "w-full text-left px-3 py-1.5 rounded-md text-xs font-medium transition-colors border truncate",
+                  isSelected
+                    ? "bg-primary/10 text-primary border-primary/30"
+                    : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-400 dark:border-slate-800 dark:hover:bg-slate-800"
+                )}
+                title={group}
+              >
+                {group}
+              </button>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 type TextSearchTabProps = {
   textSearch: string
@@ -71,23 +123,12 @@ export function TextSearchTab({
               >
                 All Groups
               </button>
-              {allGroups.map((group) => {
-                const isSelected = selectedGroupsForTextSearch.includes(group)
-                return (
-                  <button
-                    key={group}
-                    onClick={() => toggleGroup(group)}
-                    className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors border ${
-                      isSelected
-                        ? "bg-primary/10 text-primary border-primary/30"
-                        : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-400 dark:border-slate-800 dark:hover:bg-slate-800"
-                    }`}
-                  >
-                    {group}
-                  </button>
-                )
-              })}
             </div>
+            <VirtualizedTextSearchGroupList
+              allGroups={allGroups}
+              selectedGroupsForTextSearch={selectedGroupsForTextSearch}
+              onToggleGroup={toggleGroup}
+            />
           </div>
 
           <div className="pt-4 border-t">

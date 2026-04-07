@@ -14,6 +14,8 @@ export type SongSearchPayload = {
   song_ids2: string[]
   groups: string[]
   algo: string
+  randomness?: number
+  skew?: number
 }
 
 export type UploadMode = "url" | "songQueries"

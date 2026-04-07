@@ -26,6 +26,8 @@ export default function Home() {
   const [selectedGroupsForSearch, setSelectedGroupsForSearch] = useState<string[]>([])
   const [selectedFromGroup, setSelectedFromGroup] = useState<{ [group: string]: string[] }>({})
   const [algo, setAlgo] = useState("Multi-Centroid")
+  const [searchRandomness, setSearchRandomness] = useState(0)
+  const [searchSkew, setSearchSkew] = useState(1)
   const [isSongSearching, setIsSongSearching] = useState(false)
 
   // Text Search Tab
@@ -149,7 +151,7 @@ export default function Home() {
     }
   }
 
-  const handleSearchSong = async ({ song_ids1, song_ids2, groups, algo }: SongSearchPayload) => {
+  const handleSearchSong = async ({ song_ids1, song_ids2, groups, algo, randomness, skew }: SongSearchPayload) => {
     if (song_ids1.length === 0 && song_ids2.length === 0) {
       setStatus("Select at least one song.")
       return
@@ -162,7 +164,9 @@ export default function Home() {
         song_ids1,
         song_ids2,
         groups,
-        algo
+        algo,
+        randomness,
+        skew,
       })
       setResults(res.data.results || [])
       setStatus("Ready!")
@@ -346,6 +350,10 @@ export default function Home() {
             setSelectedGroupsForSearch={setSelectedGroupsForSearch}
             algo={algo}
             setAlgo={setAlgo}
+            randomness={searchRandomness}
+            setRandomness={setSearchRandomness}
+            skew={searchSkew}
+            setSkew={setSearchSkew}
             isReady={isReady}
             isSearching={isSongSearching}
             onSearch={handleSearchSong}

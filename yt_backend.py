@@ -247,9 +247,8 @@ def combine_embeddings(embeds, algo: str):
     num_clusters = min(3, len(stacked))
     if num_clusters <= 1:
         return stacked
-        
-    g = torch.Generator(device=device).manual_seed(42)
-    indices = torch.randperm(len(stacked), generator=g, device=device)[:num_clusters]
+
+    indices = torch.randperm(len(stacked), device=device)[:num_clusters]
     centroids = stacked[indices]
     
     for _ in range(20):
@@ -299,27 +298,47 @@ class SearchSongReq(BaseModel):
     song_ids2: List[str] = Field(default_factory=list)
     groups: List[str] = Field(default_factory=list)
     algo: str = "Multi-Centroid"
+    randomness: float = Field(default=0.0, ge=0.0, le=1.0)
+    skew: float = Field(default=1.0, ge=0.25, le=3.0)
 
 @app.post("/search/song")
 def search_song(req: SearchSongReq):
     if not is_ready:
         raise HTTPException(status_code=503, detail="Backend not ready yet")
-    
+
     search_groups = req.groups if req.groups else list(audio_embeddings.keys())
-    
-    valid_songs_1 = []
-    valid_songs_2 = []
-    for group in search_groups:
-        if group in audio_embeddings:
-            valid_songs_1.extend([sid for sid in req.song_ids1 if sid in audio_embeddings[group]])
-            valid_songs_2.extend([sid for sid in req.song_ids2 if sid in audio_embeddings[group]])
-    
+
+    def find_valid_song_ids(song_ids: List[str], groups: List[str]) -> List[str]:
+        seen = set()
+        valid: List[str] = []
+        for sid in song_ids:
+            if sid in seen:
+                continue
+            for group in groups:
+                if group in audio_embeddings and sid in audio_embeddings[group]:
+                    valid.append(sid)
+                    seen.add(sid)
+                    break
+        return valid
+
+    valid_songs_1 = find_valid_song_ids(req.song_ids1, search_groups)
+    valid_songs_2 = find_valid_song_ids(req.song_ids2, search_groups)
+
+    # Recovery path: selected seeds may belong to groups that are not currently checked.
+    # Keep result filtering on `search_groups`, but resolve seed embeddings from all groups.
+    lookup_groups = search_groups
     if not valid_songs_1 and not valid_songs_2:
-        raise HTTPException(status_code=400, detail="No valid songs found in specified groups")
-    
+        all_groups = list(audio_embeddings.keys())
+        valid_songs_1 = find_valid_song_ids(req.song_ids1, all_groups)
+        valid_songs_2 = find_valid_song_ids(req.song_ids2, all_groups)
+        lookup_groups = all_groups
+
+    if not valid_songs_1 and not valid_songs_2:
+        raise HTTPException(status_code=400, detail="No valid songs found in library")
+
     embeds_to_search = []
     for song_id in valid_songs_1 + valid_songs_2:
-        for group in search_groups:
+        for group in lookup_groups:
             if group in audio_embeddings and song_id in audio_embeddings[group]:
                 embeds_to_search.append(audio_embeddings[group][song_id])
                 break
@@ -366,7 +385,24 @@ def search_song(req: SearchSongReq):
                 "similarity": sim_val
             })
         
-    results.sort(key=lambda x: x["similarity"], reverse=True)
+    randomness = max(0.0, min(1.0, req.randomness))
+    skew = max(0.25, min(3.0, req.skew))
+
+    # Defaults preserve old behavior; optional controls allow broader or noisier ranking.
+    if randomness == 0.0 and abs(skew - 1.0) < 1e-9:
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+    else:
+        for item in results:
+            base = (item["similarity"] + 1.0) / 2.0
+            base = max(0.0, min(1.0, base))
+            skewed = base ** skew
+            random_component = torch.rand(1).item()
+            item["_rank_score"] = (1.0 - randomness) * skewed + randomness * random_component
+
+        results.sort(key=lambda x: x.get("_rank_score", 0.0), reverse=True)
+        for item in results:
+            item.pop("_rank_score", None)
+
     return {"results": results[:100]}
 
 class SearchTextReq(BaseModel):

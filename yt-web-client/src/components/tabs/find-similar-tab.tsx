@@ -4,11 +4,121 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { cn } from "@/lib/utils"
 import { LibraryStructure, SongSearchPayload } from "@/types/music2vec"
 import { useVirtualizer } from '@tanstack/react-virtual'
+
+const VirtualizedGroupFilterList = ({
+  allGroups,
+  filteredGroups,
+  selectedGroupsForSearch,
+  setSelectedGroupsForSearch,
+}: {
+  allGroups: string[]
+  filteredGroups: string[]
+  selectedGroupsForSearch: string[]
+  setSelectedGroupsForSearch: React.Dispatch<React.SetStateAction<string[]>>
+}) => {
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const virtualizer = useVirtualizer({
+    count: filteredGroups.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 34,
+    overscan: 12,
+  })
+
+  return (
+    <div ref={parentRef} className="max-h-44 overflow-y-auto">
+      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => {
+          const group = filteredGroups[virtualRow.index]
+          const checked = selectedGroupsForSearch.length === 0 || selectedGroupsForSearch.includes(group)
+
+          return (
+            <div
+              key={`${group}-${virtualRow.index}`}
+              className="absolute left-0 top-0 w-full px-0.5"
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+              <div className="flex items-center space-x-3 pt-1">
+                <Checkbox
+                  id={`search-group-${group}`}
+                  checked={checked}
+                  onCheckedChange={(nextChecked) => {
+                    if (nextChecked === true) {
+                      const newSelection = selectedGroupsForSearch.length === 0
+                        ? allGroups.filter((g) => g !== group)
+                        : [...selectedGroupsForSearch.filter((g) => g !== '___NONE___'), group]
+
+                      if (newSelection.length === allGroups.length) {
+                        setSelectedGroupsForSearch([])
+                      } else {
+                        setSelectedGroupsForSearch(newSelection)
+                      }
+                    } else {
+                      const newSelection = selectedGroupsForSearch.length === 0
+                        ? allGroups.filter((g) => g !== group)
+                        : selectedGroupsForSearch.filter((g) => g !== group)
+
+                      setSelectedGroupsForSearch(newSelection.length === 0 ? ['___NONE___'] : newSelection)
+                    }
+                  }}
+                />
+                <label htmlFor={`search-group-${group}`} className="text-sm cursor-pointer truncate">{group}</label>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+const VirtualizedSelectedSeedList = ({
+  selectedSongChips,
+  onRemove,
+}: {
+  selectedSongChips: { key: string; queryGroup: "group1"; songId: string; title: string; group: string }[]
+  onRemove: (queryGroup: "group1", songId: string) => void
+}) => {
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const virtualizer = useVirtualizer({
+    count: selectedSongChips.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 32,
+    overscan: 10,
+  })
+
+  return (
+    <div ref={parentRef} className="h-30 overflow-y-auto pr-2 custom-scrollbar">
+      <div className="relative w-full" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {virtualizer.getVirtualItems().map((virtualRow) => {
+          const chip = selectedSongChips[virtualRow.index]
+          return (
+            <div
+              key={`${chip.queryGroup}-${chip.songId}-${virtualRow.index}`}
+              className="absolute left-0 top-0 w-full"
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+              <button
+                className="w-full inline-flex items-center justify-between gap-2 px-2.5 py-1 rounded-md text-xs border bg-white dark:bg-slate-900 hover:border-primary/40"
+                onClick={() => onRemove(chip.queryGroup, chip.songId)}
+                title={`Remove ${chip.title}`}
+              >
+                <span className="font-medium truncate">{chip.title}</span>
+                <span className="text-[11px] text-muted-foreground truncate">{chip.group}</span>
+                <X className="w-3 h-3 shrink-0" />
+              </button>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 const VirtualizedSearchSongs = ({
   normalizedLibrary,
@@ -173,6 +283,10 @@ type FindSimilarTabProps = {
   setSelectedGroupsForSearch: React.Dispatch<React.SetStateAction<string[]>>
   algo: string
   setAlgo: React.Dispatch<React.SetStateAction<string>>
+  randomness: number
+  setRandomness: React.Dispatch<React.SetStateAction<number>>
+  skew: number
+  setSkew: React.Dispatch<React.SetStateAction<number>>
   isReady: boolean
   isSearching: boolean
   onSearch: (payload: SongSearchPayload) => Promise<void>
@@ -190,6 +304,10 @@ export function FindSimilarTab({
   setSelectedGroupsForSearch,
   algo,
   setAlgo,
+  randomness,
+  setRandomness,
+  skew,
+  setSkew,
   isReady,
   isSearching,
   onSearch,
@@ -201,6 +319,16 @@ export function FindSimilarTab({
   const [groupFilter, setGroupFilter] = useState("")
 
   const selectedSongCount = (selectedFromGroup.group1?.length || 0)
+
+  const songMetaById = useMemo(() => {
+    const map = new Map<string, { title: string; group: string }>()
+    for (const [group, songs] of Object.entries(library)) {
+      for (const [id, title] of Object.entries(songs)) {
+        map.set(id, { title, group })
+      }
+    }
+    return map
+  }, [library])
 
   const normalizedLibrary = useMemo(() => {
     return Object.entries(library)
@@ -221,17 +349,15 @@ export function FindSimilarTab({
     const chips: { key: string; queryGroup: "group1"; songId: string; title: string; group: string }[] = []
     for (const queryGroup of ["group1"] as const) {
       const selectedIds = selectedFromGroup[queryGroup] || []
-      for (const [group, songs] of Object.entries(library)) {
-        for (const id of selectedIds) {
-          const title = songs[id]
-          if (title) {
-            chips.push({ key: `${queryGroup}-${id}`, queryGroup, songId: id, title, group })
-          }
+      for (const id of selectedIds) {
+        const songMeta = songMetaById.get(id)
+        if (songMeta) {
+          chips.push({ key: `${queryGroup}-${id}`, queryGroup, songId: id, title: songMeta.title, group: songMeta.group })
         }
       }
     }
     return chips
-  }, [library, selectedFromGroup])
+  }, [selectedFromGroup, songMetaById])
 
   const toggleSongSelection = (queryGroup: "group1", songId: string) => {
     setSelectedFromGroup((prev) => {
@@ -269,6 +395,8 @@ export function FindSimilarTab({
       song_ids2: [],
       groups: selectedGroupsForSearch.length === 0 ? allGroups : selectedGroupsForSearch.filter(g => g !== '___NONE___'),
       algo,
+      randomness,
+      skew,
     }
 
     await onSearch(payload)
@@ -337,19 +465,7 @@ export function FindSimilarTab({
             <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-primary/10 text-primary">{selectedSongCount} songs</span>
           </div>
           {selectedSongChips.length > 0 ? (
-            <div className="flex flex-wrap gap-2 max-h-[120px] overflow-y-auto pr-2 custom-scrollbar">
-              {selectedSongChips.map((chip, idx) => (
-                <button
-                  key={`${chip.queryGroup}-${chip.songId}-${idx}`}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs border bg-white dark:bg-slate-900 hover:border-primary/40"
-                  onClick={() => removeSelectedSong(chip.queryGroup, chip.songId)}
-                  title={`Remove ${chip.title}`}
-                >
-                  <span className="font-medium">{chip.title}</span>
-                  <X className="w-3 h-3" />
-                </button>
-              ))}
-            </div>
+            <VirtualizedSelectedSeedList selectedSongChips={selectedSongChips} onRemove={removeSelectedSong} />
           ) : (
             <p className="text-sm text-muted-foreground">No seed songs selected yet.</p>
           )}
@@ -398,34 +514,12 @@ export function FindSimilarTab({
                   <label htmlFor="all-groups" className="text-sm font-medium cursor-pointer">Search All Groups</label>
                 </div>
 
-                {filteredGroupsForSearch.map((group) => (
-                  <div key={group} className="flex items-center space-x-3 pt-1">
-                    <Checkbox
-                      id={`search-group-${group}`}
-                      checked={selectedGroupsForSearch.length === 0 || selectedGroupsForSearch.includes(group)}
-                      onCheckedChange={(checked) => {
-                        if (checked === true) {
-                          const newSelection = selectedGroupsForSearch.length === 0 
-                            ? allGroups.filter(g => g !== group) // should not happen if checked goes true, because if it was 0, it was true, so it would go false. But if it was false, length > 0
-                            : [...selectedGroupsForSearch.filter(g => g !== '___NONE___'), group]
-                          
-                          if (newSelection.length === allGroups.length) {
-                            setSelectedGroupsForSearch([]) // reset to default
-                          } else {
-                            setSelectedGroupsForSearch(newSelection)
-                          }
-                        } else {
-                          const newSelection = selectedGroupsForSearch.length === 0
-                            ? allGroups.filter(g => g !== group)
-                            : selectedGroupsForSearch.filter((g) => g !== group)
-                            
-                          setSelectedGroupsForSearch(newSelection.length === 0 ? ['___NONE___'] : newSelection)
-                        }
-                      }}
-                    />
-                    <label htmlFor={`search-group-${group}`} className="text-sm cursor-pointer truncate">{group}</label>
-                  </div>
-                ))}
+                <VirtualizedGroupFilterList
+                  allGroups={allGroups}
+                  filteredGroups={filteredGroupsForSearch}
+                  selectedGroupsForSearch={selectedGroupsForSearch}
+                  setSelectedGroupsForSearch={setSelectedGroupsForSearch}
+                />
                 {filteredGroupsForSearch.length === 0 && (
                   <p className="text-xs text-muted-foreground py-3">No groups match this filter.</p>
                 )}
@@ -450,6 +544,42 @@ export function FindSimilarTab({
                     ? "Multi-Centroid keeps multiple focus points from your seeds for broader discovery with stronger variety."
                     : "Average Vector blends all seeds into one center point for tighter and more literal similarity matches."}
                 </p>
+              </div>
+
+              <div className="rounded-lg border p-3 bg-slate-50/40 dark:bg-slate-900/30 space-y-3">
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold">Randomness</label>
+                    <span className="text-xs text-muted-foreground">{Math.round(randomness * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(randomness * 100)}
+                    onChange={(e) => setRandomness(Number(e.target.value) / 100)}
+                    className="w-full"
+                  />
+                  <p className="text-xs text-muted-foreground">Higher values introduce more exploratory randomness in ranking.</p>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-semibold">Skew</label>
+                    <span className="text-xs text-muted-foreground">{skew.toFixed(2)}x</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={25}
+                    max={300}
+                    step={5}
+                    value={Math.round(skew * 100)}
+                    onChange={(e) => setSkew(Number(e.target.value) / 100)}
+                    className="w-full"
+                  />
+                  <p className="text-xs text-muted-foreground">Above 1.0 favors tighter matches, below 1.0 broadens variety.</p>
+                </div>
               </div>
             </div>
           </div>
