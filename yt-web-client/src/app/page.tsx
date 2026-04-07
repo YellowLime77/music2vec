@@ -12,7 +12,13 @@ import { VisualizationTab } from "@/components/tabs/visualization-tab"
 import { UploadTab } from "@/components/tabs/upload-tab"
 import { LibraryStructure, SearchResult, SongSearchPayload, TabId, UploadMode, VisualizationPoint, VisualizationTextPoint } from "@/types/music2vec"
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "")
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  headers: {
+    "ngrok-skip-browser-warning": "1",
+  },
+})
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>("library")
@@ -87,7 +93,7 @@ export default function Home() {
 
   const checkExtractStatus = async () => {
     try {
-      const resp = await axios.get(`${API_BASE_URL}/extract_status`)
+      const resp = await api.get("/extract_status")
       if (resp.data.status && resp.data.is_extracting) {
         setStatus(resp.data.status)
         setExtractProgress(resp.data.progress || 0)
@@ -99,7 +105,7 @@ export default function Home() {
 
   const checkStatus = async () => {
     try {
-      const resp = await axios.get(`${API_BASE_URL}/status`)
+      const resp = await api.get("/status")
       setStatus(resp.data.status || "Unknown Status")
       setLoadProgress(resp.data.progress || 0)
       if (resp.data.ready) {
@@ -112,7 +118,7 @@ export default function Home() {
 
   const fetchLibrary = async () => {
     try {
-      const resp = await axios.get(`${API_BASE_URL}/library`)
+      const resp = await api.get("/library")
       setLibrary(resp.data.library || {})
     } catch (e: unknown) {
       if (e instanceof Error) setStatus(`Error fetching library: ${e.message}`)
@@ -122,7 +128,7 @@ export default function Home() {
   const fetchVisualizationPoints = async (groups: string[]) => {
     setIsVizLoading(true)
     try {
-      const resp = await axios.post(`${API_BASE_URL}/visualization/embeddings`, { groups })
+      const resp = await api.post("/visualization/embeddings", { groups })
       setVizPoints(resp.data?.points || [])
     } catch (e: unknown) {
       if (axios.isAxiosError(e)) {
@@ -138,7 +144,7 @@ export default function Home() {
   const fetchVisualizationTextPoint = async (text: string, groups: string[]) => {
     setIsVizTextLoading(true)
     try {
-      const resp = await axios.post(`${API_BASE_URL}/visualization/text`, { text, groups })
+      const resp = await api.post("/visualization/text", { text, groups })
       setVizTextPoint(resp.data?.point || null)
     } catch (e: unknown) {
       if (axios.isAxiosError(e)) {
@@ -160,7 +166,7 @@ export default function Home() {
     setStatus("Searching...")
     setIsSongSearching(true)
     try {
-      const res = await axios.post(`${API_BASE_URL}/search/song`, {
+      const res = await api.post("/search/song", {
         song_ids1,
         song_ids2,
         groups,
@@ -187,7 +193,7 @@ export default function Home() {
     
     setStatus("Searching text...")
     try {
-      const res = await axios.post(`${API_BASE_URL}/search/text`, {
+      const res = await api.post("/search/text", {
         text: textSearch.trim(),
         groups
       })
@@ -229,8 +235,8 @@ export default function Home() {
         for (let i = 0; i < lines.length; i += 1) {
           const line = lines[i]
           setStatus(`Processing URL ${i + 1}/${lines.length}...`)
-          const res = await axios.post(
-            `${API_BASE_URL}/extract`,
+          const res = await api.post(
+            "/extract",
             { group, query: line },
             { timeout: 300000 }
           )
@@ -254,7 +260,7 @@ export default function Home() {
           ? { group, query: lines[0] }
           : { group, playlist_queries: lines, query: "song-query-list" }
 
-        const res = await axios.post(`${API_BASE_URL}/extract`, payload, { timeout: 300000 })
+        const res = await api.post("/extract", payload, { timeout: 300000 })
         totalProcessed += Number(res.data?.processed || 0)
         setExtractProgress(100)
       }
@@ -284,7 +290,7 @@ export default function Home() {
     if (ytIds.length === 0) return
     setStatus(`Removing ${ytIds.length} song(s) from ${group}...`)
     try {
-      const res = await axios.post(`${API_BASE_URL}/remove_songs`, {
+      const res = await api.post("/remove_songs", {
         yt_ids: ytIds,
         group
       })
