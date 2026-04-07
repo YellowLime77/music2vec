@@ -318,6 +318,17 @@ export function FindSimilarTab({
   const [songFilterPrimary, setSongFilterPrimary] = useState("")
   const [groupFilter, setGroupFilter] = useState("")
 
+  const behaviorPresets = [
+    { label: "Stable", randomness: 0.0, skew: 1.25 },
+    { label: "Balanced", randomness: 0.2, skew: 1.0 },
+    { label: "Wild", randomness: 0.7, skew: 0.9 },
+    { label: "Serendipity", randomness: 0.9, skew: 0.65 },
+  ]
+
+  const isPresetActive = (preset: { randomness: number; skew: number }) => {
+    return Math.abs(randomness - preset.randomness) < 0.01 && Math.abs(skew - preset.skew) < 0.01
+  }
+
   const selectedSongCount = (selectedFromGroup.group1?.length || 0)
 
   const songMetaById = useMemo(() => {
@@ -547,6 +558,30 @@ export function FindSimilarTab({
               </div>
 
               <div className="rounded-lg border p-3 bg-slate-50/40 dark:bg-slate-900/30 space-y-3">
+                <div className="space-y-1">
+                  <label className="text-sm font-semibold">Behavior Presets</label>
+                  <div className="flex flex-wrap gap-2">
+                    {behaviorPresets.map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          setRandomness(preset.randomness)
+                          setSkew(preset.skew)
+                        }}
+                        className={cn(
+                          "px-2.5 py-1 rounded-md text-xs border transition-colors",
+                          isPresetActive(preset)
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+                        )}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
                     <label className="text-sm font-semibold">Randomness</label>
