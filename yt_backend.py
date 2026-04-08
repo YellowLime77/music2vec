@@ -947,8 +947,8 @@ def extract_embedding(req: UploadReq):
             'quiet': True,
             'ignoreerrors': True,
             'retries': 2,
-            'sleep_interval': 5,
-            'max_sleep_interval': 20,
+            'sleep_interval': 1,
+            'max_sleep_interval': 3,
             'sleep_requests': 1,
             'cookiefile': 'cookies.txt'
         }
@@ -1048,8 +1048,8 @@ def extract_embedding(req: UploadReq):
             'ignoreerrors': True,
             'retries': 2,
             'fragment_retries': 2,
-            'sleep_interval': 5,
-            'max_sleep_interval': 20,
+            'sleep_interval': 1,
+            'max_sleep_interval': 3,
             'sleep_requests': 1,
 
             'cookiefile': 'cookies.txt',
